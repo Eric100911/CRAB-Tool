@@ -15,7 +15,7 @@ fi
 while read -r cfg; do
     [[ -n "${cfg}" ]] || continue
     task_dir="crab_${cfg%.py}"
-    cmd=(crab resubmit -d "${task_dir}")
+    cmd=(crab kill -d "${task_dir}")
     if [[ -n "${X509_USER_PROXY:-}" ]]; then
         cmd+=(--proxy "${X509_USER_PROXY}")
     fi

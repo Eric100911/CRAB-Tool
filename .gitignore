@@ -1,0 +1,4 @@
+__pycache__/
+generated_crab_configs.txt
+crab3_*.py
+!crab3_template.py
