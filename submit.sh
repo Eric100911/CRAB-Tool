@@ -20,9 +20,9 @@ while read -r cfg; do
     fi
 
     cmd=(crab submit -c "${cfg}")
-    if [[ -n "${X509_USER_PROXY:-}" ]]; then
-        cmd+=(--proxy "${X509_USER_PROXY}")
-    fi
+    # if [[ -n "${X509_USER_PROXY:-}" ]]; then
+    #     cmd+=(--proxy "${X509_USER_PROXY}")
+    # fi
 
     if [[ "${DRY_RUN}" == "1" ]]; then
         printf '%q ' "${cmd[@]}"

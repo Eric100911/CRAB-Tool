@@ -15,8 +15,13 @@ config.JobType.pyCfgParams = [
     "era=__ERA__",
     "outputFile=__OUTPUT_FILE__",
     "analysisMode=__ANALYSIS_MODE__",
+    "numThreads=4",
+    "numStreams=4",
 ]
 config.JobType.allowUndistributedCMSSW = True
+# Allow 4-thread. Memory request is 8GB.
+config.JobType.numCores = 4
+config.JobType.maxMemoryMB = 4000
 
 config.section_("Data")
 config.Data.inputDataset = "__DATASET__"
