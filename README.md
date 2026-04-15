@@ -48,16 +48,36 @@ Check status for all generated tasks:
 ./status.sh
 ```
 
+This now queries `crab status --json` for every task, writes a machine-readable
+snapshot to `status_cache/latest_summary.json`, and stores per-task job payloads
+under `status_cache/tasks/`.
+
+If you need the original CRAB text output instead of the cached summary flow:
+
+```bash
+RAW_STATUS=1 ./status.sh --verboseErrors
+```
+
 Dry-run resubmission commands:
 
 ```bash
 ./resubmit.sh
 ```
 
+`resubmit.sh` now refreshes the status snapshot first and only prints
+`crab resubmit` commands for tasks that currently contain failed jobs. The
+commands use `--jobids` so only the failed CRAB jobs are retried.
+
 Actually resubmit:
 
 ```bash
 DRY_RUN=0 ./resubmit.sh
+```
+
+Reuse an existing snapshot without re-querying CRAB:
+
+```bash
+USE_CACHED_STATUS=1 DRY_RUN=1 ./resubmit.sh
 ```
 
 Kill generated tasks:
@@ -91,3 +111,6 @@ You can override defaults when generating CRAB configs:
   `generated_crab_configs.txt` before writing a fresh set.
 - Generated request names encode the stream index and the processed campaign so
   distinct prompt-reco versions do not collide.
+- `crab status --json` still prints a human-readable header before the JSON
+  payload, so the helper extracts the final JSON object from stdout before
+  summarizing job states.
