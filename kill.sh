@@ -14,20 +14,16 @@ fi
 
 while read -r cfg; do
     [[ -n "${cfg}" ]] || continue
-    if [[ ! -f "${cfg}" ]]; then
-        echo "Missing CRAB config ${cfg}. Regenerate with ./registerData.sh." >&2
-        exit 1
-    fi
-
-    cmd=(crab submit -c "${cfg}")
-    # if [[ -n "${X509_USER_PROXY:-}" ]]; then
-    #     cmd+=(--proxy "${X509_USER_PROXY}")
-    # fi
+    task_dir="crab_${cfg%.py}"
+    cmd=(crab kill -d "${task_dir}")
+    #if [[ -n "${X509_USER_PROXY:-}" ]]; then
+    #    cmd+=(--proxy "${X509_USER_PROXY}")
+    #fi
 
     if [[ "${DRY_RUN}" == "1" ]]; then
-        printf '%q ' "${cmd[@]}"
+        printf '%q ' "${cmd[@]}" "$@"
         printf '\n'
     else
-        "${cmd[@]}"
+        "${cmd[@]}" "$@"
     fi
 done < "${MANIFEST}"
