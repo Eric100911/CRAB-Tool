@@ -3,12 +3,15 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
+source "${SCRIPT_DIR}/crab_common.sh"
 
 MANIFEST="${CRAB_MANIFEST:-generated_crab_configs.txt}"
-DRY_RUN="${DRY_RUN:-1}"
-USE_CACHED_STATUS="${USE_CACHED_STATUS:-0}"
+CLI_DRY_RUN=""
+CLI_USE_CACHED_STATUS=""
 STATUS_CACHE_DIR="${STATUS_CACHE_DIR:-status_cache}"
 SUMMARY_FILE="${STATUS_CACHE_DIR}/latest_summary.json"
+SHOW_HELP=0
+declare -a FORWARD_ARGS=()
 
 declare -a failed_tasks=()
 
@@ -22,13 +25,99 @@ is_no_jobs_to_resubmit_output() {
         [[ "${normalized}" == *"doesn't have jobs to resubmit"* ]]
 }
 
-if [[ ! -f "${MANIFEST}" ]]; then
-    echo "Missing ${MANIFEST}. Run ./registerData.sh first." >&2
-    exit 1
+show_help() {
+    cat <<'EOF'
+Usage: ./resubmit.sh [options] [-- crab resubmit options]
+
+Refresh the cached task status if needed, then resubmit only the failed CRAB
+jobs for tasks that currently contain failures.
+
+Options:
+  -h, --help              Show this help text and exit.
+  --manifest PATH         Manifest file to read. Falls back to CRAB_MANIFEST.
+  --status-cache-dir PATH Status cache directory. Falls back to STATUS_CACHE_DIR.
+  --dry-run               Print crab resubmit commands without executing them.
+  --execute               Execute crab resubmit for each failed task.
+  --use-cached-status     Reuse the existing status snapshot if it exists.
+  --refresh-status        Force a fresh status collection before resubmitting.
+  --                      Stop parsing wrapper options and pass the rest to crab resubmit.
+
+Environment fallback:
+  CRAB_MANIFEST           Default manifest path.
+  STATUS_CACHE_DIR        Default status cache directory.
+  DRY_RUN                 Default dry-run mode (accepted values: 0/1/true/false).
+  USE_CACHED_STATUS       Default cache reuse mode (accepted values: 0/1/true/false).
+
+Preconditions:
+  - Run 'cmsenv' in this CMSSW work area first.
+  - Export X509_USER_PROXY before resubmitting jobs.
+
+Examples:
+  ./resubmit.sh
+  ./resubmit.sh --execute
+  ./resubmit.sh --use-cached-status --execute -- --siteblacklist T2_FOO
+EOF
+}
+
+while (($#)); do
+    case "$1" in
+        -h|--help)
+            SHOW_HELP=1
+            shift
+            ;;
+        --manifest)
+            require_option_value "$1" "${2:-}"
+            MANIFEST="$2"
+            shift 2
+            ;;
+        --status-cache-dir)
+            require_option_value "$1" "${2:-}"
+            STATUS_CACHE_DIR="$2"
+            shift 2
+            ;;
+        --dry-run)
+            CLI_DRY_RUN=1
+            shift
+            ;;
+        --execute)
+            CLI_DRY_RUN=0
+            shift
+            ;;
+        --use-cached-status)
+            CLI_USE_CACHED_STATUS=1
+            shift
+            ;;
+        --refresh-status)
+            CLI_USE_CACHED_STATUS=0
+            shift
+            ;;
+        --)
+            shift
+            FORWARD_ARGS=("$@")
+            break
+            ;;
+        *)
+            FORWARD_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+if [[ "${SHOW_HELP}" == "1" ]]; then
+    show_help
+    exit 0
 fi
 
+DRY_RUN="$(resolve_bool "DRY_RUN" "${CLI_DRY_RUN}" "${DRY_RUN:-}" "1")"
+USE_CACHED_STATUS="$(resolve_bool "USE_CACHED_STATUS" "${CLI_USE_CACHED_STATUS}" "${USE_CACHED_STATUS:-}" "0")"
+SUMMARY_FILE="${STATUS_CACHE_DIR}/latest_summary.json"
+
+require_cmssw_env
+require_manifest "${MANIFEST}"
+require_proxy_env
+
 if [[ "${USE_CACHED_STATUS}" != "1" || ! -f "${SUMMARY_FILE}" ]]; then
-    STATUS_CACHE_DIR="${STATUS_CACHE_DIR}" CRAB_MANIFEST="${MANIFEST}" ./status.sh
+    ./status.sh --manifest "${MANIFEST}" --cache-dir "${STATUS_CACHE_DIR}"
 fi
 
 if ! failed_output="$(
@@ -49,15 +138,18 @@ for entry in "${failed_entries[@]}"; do
     [[ -n "${task_dir}" ]] || continue
 
     cmd=(crab resubmit -d "${task_dir}" --jobids "${failed_job_ids}")
+    if ((${#FORWARD_ARGS[@]} > 0)); then
+        cmd+=("${FORWARD_ARGS[@]}")
+    fi
 
     if [[ "${DRY_RUN}" == "1" ]]; then
         printf '[failed=%s] ' "${failed_count}"
-        printf '%q ' "${cmd[@]}" "$@"
+        printf '%q ' "${cmd[@]}"
         printf '\n'
         continue
     fi
 
-    if output="$("${cmd[@]}" "$@" 2>&1)"; then
+    if output="$("${cmd[@]}" 2>&1)"; then
         printf '%s\n' "${output}"
         continue
     fi

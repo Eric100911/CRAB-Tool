@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import importlib.util
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -23,6 +24,14 @@ Status on the CRAB server:\tSUBMITTED
 Status on the scheduler:\tSUBMITTED
 
 {"1": {"State": "finished", "Error": [0, "OK", {}], "JobIds": ["144836102.0"]}, "2": {"State": "failed", "Error": [8020, "File open error", {}], "JobIds": ["144836103.0"]}, "3": {"State": "transferring", "Error": [0, "OK", {}], "JobIds": ["144836104.0"]}}
+Log file is /path/to/crab.log
+"""
+
+KILLED_STATUS_OUTPUT = """Rucio client intialized for account chiw
+CRAB project directory:\t\t/path/to/crab_task
+Task name:\t\t\t260411_080042:chiw_crab_task
+Status on the CRAB server:\tKILLED
+
 Log file is /path/to/crab.log
 """
 
@@ -54,6 +63,46 @@ class CrabStatusSnapshotTest(unittest.TestCase):
             )
             args = type("Args", (), {"summary_file": str(summary_path)})
             self.assertEqual(snapshot.run_list_failed(args), 1)
+
+    def test_build_task_summary_treats_killed_without_json_as_header_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            task_dir = Path(tmpdir) / "crab_task"
+            task_dir.mkdir()
+            original_query = snapshot.query_task_status
+            try:
+                snapshot.query_task_status = lambda *_args, **_kwargs: (
+                    subprocess.CompletedProcess(
+                        args=["crab", "status"],
+                        returncode=0,
+                        stdout=KILLED_STATUS_OUTPUT,
+                        stderr="",
+                    ),
+                    ["crab", "status", "-d", str(task_dir), "--json"],
+                )
+                summary, payload, stdout, stderr, cmd = snapshot.build_task_summary(
+                    "sample.py", task_dir, []
+                )
+            finally:
+                snapshot.query_task_status = original_query
+
+            self.assertIsNone(payload)
+            self.assertEqual(stdout, KILLED_STATUS_OUTPUT)
+            self.assertEqual(stderr, "")
+            self.assertIn("--json", cmd)
+            self.assertEqual(
+                summary["status_collection_state"],
+                snapshot.STATUS_COLLECTION_HEADER_ONLY_KILLED,
+            )
+            self.assertIsNone(summary["query_error"])
+            self.assertIn("Failed to parse status JSON", summary["query_warning"])
+
+    def test_task_dir_from_cfg_uses_task_root_even_for_absolute_cfg(self) -> None:
+        task_root = Path("/tmp/work")
+        cfg = "/tmp/somewhere/configs/sample.py"
+        self.assertEqual(
+            snapshot.task_dir_from_cfg(task_root, cfg),
+            task_root / "crab_sample",
+        )
 
 
 if __name__ == "__main__":

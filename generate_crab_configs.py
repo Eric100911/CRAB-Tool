@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import os
 import re
 from pathlib import Path
 
@@ -18,22 +19,77 @@ LUMI_MASK_BY_YEAR = {
 }
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate CRAB configs from one template")
+class HelpFormatter(
+    argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter
+):
+    """Help formatter with defaults and preserved line breaks."""
+
+
+def ensure_cmssw_env() -> None:
+    required = ("CMSSW_BASE", "CMSSW_RELEASE_BASE", "SCRAM_ARCH")
+    missing = [name for name in required if not os.environ.get(name)]
+    if missing:
+        missing_names = ", ".join(missing)
+        raise RuntimeError(
+            "CMSSW environment is not active. "
+            f"Missing {missing_names}. Run 'cmsenv' first."
+        )
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Generate CRAB configuration files from one template and local dataset lists.",
+        formatter_class=HelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  generate_crab_configs.py\n"
+            "  generate_crab_configs.py --lists RundataList_2025.txt --units-per-job 20\n"
+            "  generate_crab_configs.py --template crab3_template.py --manifest my_manifest.txt\n"
+        ),
+    )
     parser.add_argument(
         "--lists",
         nargs="*",
         default=[],
         help="Dataset list files. If omitted, use local RundataList_*.txt files.",
     )
-    parser.add_argument("--template", default="crab3_template.py")
-    parser.add_argument("--manifest", default=MANIFEST_NAME)
-    parser.add_argument("--prefix", default="crab3_refactor")
-    parser.add_argument("--analysis-mode", default="JpsiJpsiPhi")
-    parser.add_argument("--units-per-job", type=int, default=20)
-    parser.add_argument("--storage-site", default="T3_CH_CERNBOX")
-    parser.add_argument("--outlfn", default="/store/user/chiw/JpsiJpsiPhi/rootNtuple/")
-    return parser.parse_args()
+    parser.add_argument(
+        "--template",
+        default="crab3_template.py",
+        help="Base CRAB configuration template to render for each dataset.",
+    )
+    parser.add_argument(
+        "--manifest",
+        default=MANIFEST_NAME,
+        help="Output manifest file that records all generated config paths.",
+    )
+    parser.add_argument(
+        "--prefix",
+        default="crab3_refactor",
+        help="Request-name prefix used for generated CRAB configs.",
+    )
+    parser.add_argument(
+        "--analysis-mode",
+        default="JpsiJpsiPhi",
+        help="Value injected into the CMSSW analysisMode parameter.",
+    )
+    parser.add_argument(
+        "--units-per-job",
+        type=int,
+        default=20,
+        help="LumiBased splitting size written into each generated config.",
+    )
+    parser.add_argument(
+        "--storage-site",
+        default="T3_CH_CERNBOX",
+        help="Target CRAB storage site for generated configs.",
+    )
+    parser.add_argument(
+        "--outlfn",
+        default="/store/user/chiw/JpsiJpsiPhi/rootNtuple/",
+        help="Base output LFN directory written into generated configs.",
+    )
+    return parser.parse_args(argv)
 
 
 def sanitize_token(token: str) -> str:
@@ -113,6 +169,7 @@ def cleanup_previous_configs(manifest_path: Path) -> None:
 
 def main() -> int:
     args = parse_args()
+    ensure_cmssw_env()
 
     template_path = Path(args.template)
     if not template_path.exists():

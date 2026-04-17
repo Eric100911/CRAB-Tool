@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import collections
 import json
+import os
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -18,25 +19,86 @@ INCOMPATIBLE_STATUS_ARGS = {
     "--summary",
     "--verboseErrors",
 }
+STATUS_COLLECTION_OK = "ok_json"
+STATUS_COLLECTION_HEADER_ONLY_KILLED = "header_only_killed"
+STATUS_COLLECTION_FATAL_ERROR = "fatal_error"
+
+
+class HelpFormatter(
+    argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter
+):
+    """Help formatter with defaults and preserved line breaks."""
+
+
+def ensure_cmssw_env() -> None:
+    required = ("CMSSW_BASE", "CMSSW_RELEASE_BASE", "SCRAM_ARCH")
+    missing = [name for name in required if not os.environ.get(name)]
+    if missing:
+        missing_names = ", ".join(missing)
+        raise RuntimeError(
+            "CMSSW environment is not active. "
+            f"Missing {missing_names}. Run 'cmsenv' first."
+        )
 
 
 def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[str]]:
     parser = argparse.ArgumentParser(
-        description="Collect CRAB status snapshots and list tasks with failed jobs."
+        description="Collect machine-readable CRAB status snapshots and list failed jobs.",
+        formatter_class=HelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  crab_status_snapshot.py collect --cache-dir status_cache\n"
+            "  crab_status_snapshot.py collect --cache-dir status_cache -- --instance prod\n"
+            "  crab_status_snapshot.py list-failed --summary-file status_cache/latest_summary.json\n"
+        ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     collect_parser = subparsers.add_parser(
-        "collect", help="Query crab status for all tasks and save JSON summaries."
+        "collect",
+        help="Query crab status for all tasks and save JSON summaries.",
+        description=(
+            "Query 'crab status --json' for every task listed in a manifest, write a "
+            "summary file, and store one per-task JSON payload under the cache directory."
+        ),
+        formatter_class=HelpFormatter,
+        epilog=(
+            "Output files:\n"
+            "  <cache-dir>/latest_summary.json\n"
+            "  <cache-dir>/tasks/<task-dir>.json\n\n"
+            "Extra arguments after '--' are forwarded to 'crab status --json'.\n"
+            "Do not combine machine-readable mode with --long, --summary, --sort,\n"
+            "--verboseErrors, or --jobids."
+        ),
     )
-    collect_parser.add_argument("--manifest", default="generated_crab_configs.txt")
-    collect_parser.add_argument("--cache-dir", default="status_cache")
+    collect_parser.add_argument(
+        "--manifest",
+        default="generated_crab_configs.txt",
+        help="Manifest that lists one CRAB config path per line.",
+    )
+    collect_parser.add_argument(
+        "--cache-dir",
+        default="status_cache",
+        help="Directory where the summary and per-task JSON payloads are written.",
+    )
 
     list_failed_parser = subparsers.add_parser(
-        "list-failed", help="List task directories that have failed jobs in a saved summary."
+        "list-failed",
+        help="List task directories that have failed jobs in a saved summary.",
+        description=(
+            "Read a saved latest_summary.json file and print one tab-separated line for "
+            "each task that currently contains failed CRAB jobs."
+        ),
+        formatter_class=HelpFormatter,
+        epilog=(
+            "Output columns:\n"
+            "  task_dir<TAB>comma-separated job ids<TAB>failed job count"
+        ),
     )
     list_failed_parser.add_argument(
-        "--summary-file", default="status_cache/latest_summary.json"
+        "--summary-file",
+        default="status_cache/latest_summary.json",
+        help="Status summary file produced by the collect subcommand.",
     )
 
     return parser.parse_known_args(argv)
@@ -61,8 +123,10 @@ def read_manifest(manifest_path: Path) -> list[str]:
     return [line.strip() for line in manifest_path.read_text().splitlines() if line.strip()]
 
 
-def task_dir_from_cfg(cfg: str) -> str:
-    return f"crab_{Path(cfg).stem}"
+def task_dir_from_cfg(task_root: Path, cfg: str) -> Path:
+    cfg_path = Path(cfg)
+    task_name = f"crab_{cfg_path.stem}"
+    return (task_root / task_name).resolve()
 
 
 def extract_status_payload(stdout: str) -> dict[str, dict]:
@@ -101,7 +165,9 @@ def query_task_status(task_dir: Path, extra_args: list[str]) -> tuple[subprocess
     return completed, cmd
 
 
-def build_task_summary(cfg: str, task_dir: Path, extra_args: list[str]) -> tuple[dict, dict | None]:
+def build_task_summary(
+    cfg: str, task_dir: Path, extra_args: list[str]
+) -> tuple[dict, dict | None, str, str, list[str]]:
     summary = {
         "cfg": cfg,
         "task_dir": task_dir.name,
@@ -114,12 +180,15 @@ def build_task_summary(cfg: str, task_dir: Path, extra_args: list[str]) -> tuple
         "job_states": {},
         "failed_job_count": 0,
         "failed_job_ids": [],
+        "status_collection_state": STATUS_COLLECTION_OK,
         "query_error": None,
+        "query_warning": None,
     }
 
     if not task_dir.is_dir():
+        summary["status_collection_state"] = STATUS_COLLECTION_FATAL_ERROR
         summary["query_error"] = f"Missing CRAB task directory {task_dir.name}."
-        return summary, None
+        return summary, None, "", "", []
 
     completed, cmd = query_task_status(task_dir, extra_args)
     stdout = completed.stdout
@@ -131,29 +200,41 @@ def build_task_summary(cfg: str, task_dir: Path, extra_args: list[str]) -> tuple
     summary["dashboard_url"] = extract_header_value(stdout, "Dashboard monitoring URL")
 
     if completed.returncode != 0:
+        summary["status_collection_state"] = STATUS_COLLECTION_FATAL_ERROR
         message = stderr.strip() or stdout.strip() or "unknown CRAB status failure"
         summary["query_error"] = (
             f"`{' '.join(cmd)}` failed with exit code {completed.returncode}: {message}"
         )
-        return summary, None
+        return summary, None, stdout, stderr, cmd
 
     try:
         payload = extract_status_payload(stdout)
         job_states, failed_job_ids = summarize_jobs(payload)
     except Exception as exc:
+        if summary["server_status"] == "KILLED":
+            summary["status_collection_state"] = STATUS_COLLECTION_HEADER_ONLY_KILLED
+            summary["query_warning"] = f"Failed to parse status JSON after kill: {exc}"
+            return summary, None, stdout, stderr, cmd
+        summary["status_collection_state"] = STATUS_COLLECTION_FATAL_ERROR
         summary["query_error"] = f"Failed to parse status JSON: {exc}"
-        return summary, None
+        return summary, None, stdout, stderr, cmd
 
     summary["job_count"] = len(payload)
     summary["job_states"] = job_states
     summary["failed_job_count"] = len(failed_job_ids)
     summary["failed_job_ids"] = failed_job_ids
-    return summary, payload
+    return summary, payload, stdout, stderr, cmd
 
 
 def format_task_summary(summary: dict) -> str:
     if summary["query_error"]:
         return f"{summary['task_dir']} query_error={summary['query_error']}"
+    if summary["query_warning"]:
+        return (
+            f"{summary['task_dir']} "
+            f"server={summary['server_status'] or 'unknown'} "
+            f"warning={summary['query_warning']}"
+        )
     states = " ".join(
         f"{state}={count}" for state, count in summary["job_states"].items()
     )
@@ -181,17 +262,28 @@ def run_collect(args: argparse.Namespace, extra_args: list[str]) -> int:
     entries = read_manifest(manifest_path)
     task_root = Path.cwd()
     query_failures: list[str] = []
+    header_only_killed_tasks: list[str] = []
     task_summaries: list[dict] = []
 
     for cfg in entries:
-        task_dir = (task_root / task_dir_from_cfg(cfg)).resolve()
-        summary, payload = build_task_summary(cfg, task_dir, extra_args)
+        task_dir = task_dir_from_cfg(task_root, cfg)
+        summary, payload, stdout, stderr, cmd = build_task_summary(cfg, task_dir, extra_args)
         task_status_file = task_cache_dir / f"{summary['task_dir']}.json"
         summary["task_status_file"] = str(task_status_file.relative_to(cache_dir))
 
-        if payload is not None:
-            write_json(task_status_file, {"summary": summary, "jobs": payload})
-        if summary["query_error"]:
+        task_payload = {
+            "summary": summary,
+            "jobs": payload,
+        }
+        if summary["status_collection_state"] != STATUS_COLLECTION_OK:
+            task_payload["command"] = cmd
+            task_payload["stdout"] = stdout
+            task_payload["stderr"] = stderr
+        write_json(task_status_file, task_payload)
+
+        if summary["status_collection_state"] == STATUS_COLLECTION_HEADER_ONLY_KILLED:
+            header_only_killed_tasks.append(summary["task_dir"])
+        if summary["status_collection_state"] == STATUS_COLLECTION_FATAL_ERROR:
             query_failures.append(summary["task_dir"])
 
         task_summaries.append(summary)
@@ -203,6 +295,7 @@ def run_collect(args: argparse.Namespace, extra_args: list[str]) -> int:
         "manifest": str(manifest_path),
         "task_count": len(task_summaries),
         "query_failures": query_failures,
+        "header_only_killed_tasks": header_only_killed_tasks,
         "tasks": task_summaries,
     }
     write_json(cache_dir / "latest_summary.json", latest_summary)
@@ -244,6 +337,7 @@ def run_list_failed(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args, extra_args = parse_args(argv)
+    ensure_cmssw_env()
     if args.command == "collect":
         return run_collect(args, extra_args)
     if extra_args:

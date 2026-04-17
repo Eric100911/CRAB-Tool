@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "${SCRIPT_DIR}"
+source "${SCRIPT_DIR}/crab_common.sh"
+
+MANIFEST="${CRAB_MANIFEST:-generated_crab_configs.txt}"
+CLI_USE_CACHED_STATUS=""
+STATUS_CACHE_DIR="${STATUS_CACHE_DIR:-status_cache}"
+RECOVERY_CACHE_DIR="${RECOVERY_CACHE_DIR:-recovery_cache}"
+SUMMARY_FILE="${STATUS_CACHE_DIR}/latest_summary.json"
+STUCK_HOURS="${STUCK_HOURS:-48}"
+SHOW_HELP=0
+
+show_help() {
+    cat <<'EOF'
+Usage: ./prepare_recovery_tasks.sh [options]
+
+Refresh or reuse the cached CRAB task status, build a recovery plan for stuck
+unfinished jobs, write lineage metadata, and render the recovery configs under
+recovery_cache/.
+
+Options:
+  -h, --help              Show this help text and exit.
+  --manifest PATH         Manifest file to read. Falls back to CRAB_MANIFEST.
+  --status-cache-dir PATH Status cache directory. Falls back to STATUS_CACHE_DIR.
+  --recovery-cache-dir PATH
+                          Recovery cache directory. Falls back to RECOVERY_CACHE_DIR.
+  --stuck-hours HOURS     Minimum idle/cooloff age required for recovery planning.
+  --use-cached-status     Reuse the existing status snapshot if it exists.
+  --refresh-status        Force a fresh status collection before planning recovery.
+
+Environment fallback:
+  CRAB_MANIFEST           Default manifest path.
+  STATUS_CACHE_DIR        Default status cache directory.
+  RECOVERY_CACHE_DIR      Default recovery cache directory.
+  STUCK_HOURS             Default stuck-job threshold in hours.
+  USE_CACHED_STATUS       Default cache reuse mode (accepted values: 0/1/true/false).
+
+Preconditions:
+  - Run 'cmsenv' in this CMSSW work area first.
+  - Export X509_USER_PROXY before querying CRAB.
+
+Examples:
+  ./prepare_recovery_tasks.sh
+  ./prepare_recovery_tasks.sh --use-cached-status --stuck-hours 72
+
+Outputs:
+  recovery_cache/latest_recovery_plan.json
+  recovery_cache/task_lineage.json
+  recovery_cache/tracked_configs.txt
+  recovery_cache/generated_recovery_configs.txt
+EOF
+}
+
+while (($#)); do
+    case "$1" in
+        -h|--help)
+            SHOW_HELP=1
+            shift
+            ;;
+        --manifest)
+            require_option_value "$1" "${2:-}"
+            MANIFEST="$2"
+            shift 2
+            ;;
+        --status-cache-dir)
+            require_option_value "$1" "${2:-}"
+            STATUS_CACHE_DIR="$2"
+            shift 2
+            ;;
+        --recovery-cache-dir)
+            require_option_value "$1" "${2:-}"
+            RECOVERY_CACHE_DIR="$2"
+            shift 2
+            ;;
+        --stuck-hours)
+            require_option_value "$1" "${2:-}"
+            STUCK_HOURS="$2"
+            shift 2
+            ;;
+        --use-cached-status)
+            CLI_USE_CACHED_STATUS=1
+            shift
+            ;;
+        --refresh-status)
+            CLI_USE_CACHED_STATUS=0
+            shift
+            ;;
+        *)
+            die "Unknown option for ./prepare_recovery_tasks.sh: $1"
+            ;;
+    esac
+done
+
+if [[ "${SHOW_HELP}" == "1" ]]; then
+    show_help
+    exit 0
+fi
+
+USE_CACHED_STATUS="$(resolve_bool "USE_CACHED_STATUS" "${CLI_USE_CACHED_STATUS}" "${USE_CACHED_STATUS:-}" "0")"
+SUMMARY_FILE="${STATUS_CACHE_DIR}/latest_summary.json"
+
+require_cmssw_env
+require_manifest "${MANIFEST}"
+require_proxy_env
+
+if [[ "${USE_CACHED_STATUS}" != "1" || ! -f "${SUMMARY_FILE}" ]]; then
+    ./status.sh --manifest "${MANIFEST}" --cache-dir "${STATUS_CACHE_DIR}"
+fi
+
+python3 crab_recovery_task_builder.py plan \
+    --summary-file "${SUMMARY_FILE}" \
+    --output-dir "${RECOVERY_CACHE_DIR}" \
+    --stuck-hours "${STUCK_HOURS}"
+
+python3 crab_recovery_task_builder.py render-all \
+    --plan-file "${RECOVERY_CACHE_DIR}/latest_recovery_plan.json"
