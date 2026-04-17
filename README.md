@@ -193,7 +193,8 @@ Outputs:
 Recovery overrides:
 
 - Edit `crab3_recovery_template.py` when you need recovery-specific overrides
-  such as `Data.unitsPerJob`, `Data.splitting`, `JobType.pyCfgParams`,
+  such as `Data.unitsPerJob`, `Data.splitting`,
+  `RECOVERY_PYCFG_PARAM_OVERRIDES`,
   `JobType.numCores`, `JobType.maxMemoryMB`, or other dotted `config.*` fields.
 - Leave an override as `None` to keep the builder-provided default inherited
   from the original task.
@@ -201,6 +202,12 @@ Recovery overrides:
   `./crab_recovery_task_builder.py render-all ...` after editing the template so
   the generated recovery configs under `recovery_cache/configs/` pick up the
   new overlay values.
+- `RECOVERY_PYCFG_PARAM_OVERRIDES` merges into the original task
+  `config.JobType.pyCfgParams`: existing keys are replaced in place and new keys
+  are appended.
+- If you truly need a full manual replacement for `JobType.pyCfgParams`, use the
+  generic `RECOVERY_OVERRIDES` escape hatch with
+  `"JobType.pyCfgParams": [...]`.
 - During actual recovery execution, normal tasks preserve
   `results/notFinishedLumis.json` into `recovery_cache/reports/<task>/` before
   the original task is killed. The rendered recovery config then uses that
@@ -356,7 +363,7 @@ DRY_RUN=0 ./submit.sh
 - The generated recovery config is now rendered through
   `crab3_recovery_template.py`, which acts as the supported overlay layer for
   recovery-only changes. That template can override the default inherited
-  `unitsPerJob`, splitting mode, CRAB job resources, `pyCfgParams`, and
+  `unitsPerJob`, splitting mode, CRAB job resources, keyed `pyCfgParams`, and
   arbitrary dotted `config.*` assignments without modifying either
   `crab3_template.py` or the original task config.
 - `lumisToProcess.json` is informational and is not used as the recovery lumi

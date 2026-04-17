@@ -31,7 +31,15 @@ def write_original_cfg(path: Path) -> None:
         "config.section_('General')\n"
         "config.General.requestName = 'crab3_refactor_JpsiJpsiPhi_6Run2024Hv1MINIAOD'\n"
         "config.section_('JobType')\n"
-        "config.JobType.pyCfgParams = ['runOnMC=False', 'era=Run2024H']\n"
+        "config.JobType.outputFiles = ['mymultilep_Run2024Hv1.root']\n"
+        "config.JobType.pyCfgParams = [\n"
+        "    'runOnMC=False',\n"
+        "    'era=Run2024H',\n"
+        "    'outputFile=mymultilep_Run2024Hv1.root',\n"
+        "    'analysisMode=JpsiJpsiPhi',\n"
+        "    'numThreads=4',\n"
+        "    'numStreams=4',\n"
+        "]\n"
         "config.JobType.numCores = 1\n"
         "config.JobType.maxMemoryMB = 2000\n"
         "config.section_('Data')\n"
@@ -98,19 +106,12 @@ def reset_template_overrides(template_text: str) -> str:
         (r"^RECOVERY_SPLITTING = .*$", "RECOVERY_SPLITTING = None"),
         (r"^RECOVERY_NUM_CORES = .*$", "RECOVERY_NUM_CORES = None"),
         (r"^RECOVERY_MAX_MEMORY_MB = .*$", "RECOVERY_MAX_MEMORY_MB = None"),
-        (r"^RECOVERY_PYCFG_PARAMS_APPEND = .*$", "RECOVERY_PYCFG_PARAMS_APPEND = []"),
     ]
     for pattern, replacement in replacements:
         normalized = re.sub(pattern, replacement, normalized, flags=re.MULTILINE)
     normalized = re.sub(
-        r"RECOVERY_PYCFG_PARAMS = \[\n(?:.*\n)*?\]",
-        "RECOVERY_PYCFG_PARAMS = None",
-        normalized,
-        flags=re.MULTILINE,
-    )
-    normalized = re.sub(
-        r"^RECOVERY_PYCFG_PARAMS = .*$",
-        "RECOVERY_PYCFG_PARAMS = None",
+        r"RECOVERY_PYCFG_PARAM_OVERRIDES = \{\n(?:.*\n)*?\}",
+        'RECOVERY_PYCFG_PARAM_OVERRIDES = {\n    "numThreads": 1,\n    "numStreams": 0,\n}',
         normalized,
         flags=re.MULTILINE,
     )
@@ -300,7 +301,17 @@ class CrabRecoveryTaskBuilderTest(unittest.TestCase):
             self.assertEqual(config.Data.unitsPerJob, 40)
             self.assertEqual(config.Data.outputDatasetTag, "parent__recover1")
             self.assertEqual(config.Data.splitting, "LumiBased")
-            self.assertEqual(config.JobType.pyCfgParams, ["runOnMC=False", "era=Run2024H"])
+            self.assertEqual(
+                config.JobType.pyCfgParams,
+                [
+                    "runOnMC=False",
+                    "era=Run2024H",
+                    "outputFile=mymultilep_Run2024Hv1.root",
+                    "analysisMode=JpsiJpsiPhi",
+                    "numThreads=1",
+                    "numStreams=0",
+                ],
+            )
             self.assertEqual(config.JobType.numCores, 1)
             self.assertEqual(config.JobType.maxMemoryMB, 2000)
 
@@ -320,12 +331,8 @@ class CrabRecoveryTaskBuilderTest(unittest.TestCase):
                 .replace("RECOVERY_NUM_CORES = None", "RECOVERY_NUM_CORES = 8")
                 .replace("RECOVERY_MAX_MEMORY_MB = None", "RECOVERY_MAX_MEMORY_MB = 8000")
                 .replace(
-                    "RECOVERY_PYCFG_PARAMS = None",
-                    "RECOVERY_PYCFG_PARAMS = ['runOnMC=False', 'era=Run2024H', 'numThreads=8']",
-                )
-                .replace(
-                    "RECOVERY_PYCFG_PARAMS_APPEND = []",
-                    "RECOVERY_PYCFG_PARAMS_APPEND = ['wantSummary=True']",
+                    'RECOVERY_PYCFG_PARAM_OVERRIDES = {\n    "numThreads": 1,\n    "numStreams": 0,\n}',
+                    'RECOVERY_PYCFG_PARAM_OVERRIDES = {\n    "numThreads": 8,\n    "numStreams": 0,\n    "wantSummary": True,\n}',
                 )
                 .replace(
                     "RECOVERY_OVERRIDES = {\n    # \"Site.storageSite\": \"T2_CH_CERN\",\n    # \"Data.publication\": False,\n}",
@@ -343,12 +350,59 @@ class CrabRecoveryTaskBuilderTest(unittest.TestCase):
                 [
                     "runOnMC=False",
                     "era=Run2024H",
+                    "outputFile=mymultilep_Run2024Hv1.root",
+                    "analysisMode=JpsiJpsiPhi",
                     "numThreads=8",
+                    "numStreams=0",
                     "wantSummary=True",
                 ],
             )
             self.assertEqual(config.Site.storageSite, "T2_CH_CERN")
             self.assertTrue(config.Data.publication)
+
+    def test_render_recovery_config_appends_new_pycfg_param_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            cfg_path = tmp / "parent.py"
+            write_original_cfg(cfg_path)
+
+            task = make_render_task(tmp, cfg_path)
+            task["resolved_lumi_mask"] = "/tmp/chiw/missing.json"
+
+            template_text = reset_template_overrides(TEMPLATE_PATH.read_text()).replace(
+                'RECOVERY_PYCFG_PARAM_OVERRIDES = {\n    "numThreads": 1,\n    "numStreams": 0,\n}',
+                'RECOVERY_PYCFG_PARAM_OVERRIDES = {\n    "wantSummary": True,\n}',
+            )
+
+            config = render_template_with_task(tmp, task, template_text)
+            self.assertEqual(
+                config.JobType.pyCfgParams,
+                [
+                    "runOnMC=False",
+                    "era=Run2024H",
+                    "outputFile=mymultilep_Run2024Hv1.root",
+                    "analysisMode=JpsiJpsiPhi",
+                    "numThreads=4",
+                    "numStreams=4",
+                    "wantSummary=True",
+                ],
+            )
+
+    def test_render_recovery_config_rejects_unresolved_placeholders(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            cfg_path = tmp / "parent.py"
+            write_original_cfg(cfg_path)
+
+            task = make_render_task(tmp, cfg_path)
+            task["resolved_lumi_mask"] = "/tmp/chiw/missing.json"
+
+            template_text = reset_template_overrides(TEMPLATE_PATH.read_text()) + '\nBROKEN = "__FOO__"\n'
+            template_copy = tmp / "crab3_recovery_template.py"
+            template_copy.write_text(template_text)
+
+            with self.assertRaisesRegex(ValueError, "Unresolved placeholders"):
+                builder.render_recovery_config(task, template_copy)
 
     def test_resolve_lumi_prefers_preserved_not_finished_lumis(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

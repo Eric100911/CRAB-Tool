@@ -780,6 +780,13 @@ def render_recovery_config(task: dict[str, Any], template_path: Path) -> Path:
     for key, value in replacements.items():
         rendered = rendered.replace(key, value)
 
+    unresolved = sorted(set(re.findall(r"__[A-Z0-9_]+__", rendered)))
+    if unresolved:
+        raise ValueError(
+            "Unresolved placeholders in rendered recovery config for "
+            f"{cfg_path}: {unresolved}"
+        )
+
     output_path = Path(task["recover_cfg"]).resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(rendered)

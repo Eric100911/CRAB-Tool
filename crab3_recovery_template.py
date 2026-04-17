@@ -22,18 +22,19 @@ RECOVERY_UNITS_PER_JOB = 100
 RECOVERY_SPLITTING = None
 RECOVERY_NUM_CORES = 1
 RECOVERY_MAX_MEMORY_MB = 1000
-RECOVERY_PYCFG_PARAMS = [
-    "runOnMC=False",
-    "era=__ERA__",
-    "outputFile=__OUTPUT_FILE__",
-    "analysisMode=__ANALYSIS_MODE__",
-    "numThreads=1",
-    "numStreams=0",
-]
-RECOVERY_PYCFG_PARAMS_APPEND = []
+RECOVERY_PYCFG_PARAM_OVERRIDES = {
+    "numThreads": 1,
+    "numStreams": 0,
+}
 RECOVERY_OVERRIDES = {
     # "Site.storageSite": "T2_CH_CERN",
     # "Data.publication": False,
+    # "JobType.pyCfgParams": [
+    #     "runOnMC=False",
+    #     "era=Run2022E",
+    #     "outputFile=mymultilep_Run2022Ev1.root",
+    #     "analysisMode=JpsiJpsiPhi",
+    # ],
 }
 
 
@@ -45,6 +46,29 @@ def apply_dotted_override(config_obj, dotted_path, value):
     for part in parts[:-1]:
         target = getattr(target, part)
     setattr(target, parts[-1], value)
+
+
+def merge_pycfg_params(base_params, overrides):
+    override_map = {str(key): str(value) for key, value in overrides.items()}
+    remaining = dict(override_map)
+    merged = []
+
+    for item in base_params:
+        if isinstance(item, str) and "=" in item:
+            key, _value = item.split("=", 1)
+            if key in override_map:
+                merged.append(f"{key}={override_map[key]}")
+                remaining.pop(key, None)
+            else:
+                merged.append(item)
+        else:
+            merged.append(item)
+
+    for key, value in override_map.items():
+        if key in remaining:
+            merged.append(f"{key}={value}")
+
+    return merged
 
 
 config.General.requestName = RECOVERY_REQUEST_NAME
@@ -62,11 +86,11 @@ if RECOVERY_NUM_CORES is not None:
     config.JobType.numCores = RECOVERY_NUM_CORES
 if RECOVERY_MAX_MEMORY_MB is not None:
     config.JobType.maxMemoryMB = RECOVERY_MAX_MEMORY_MB
-if RECOVERY_PYCFG_PARAMS is not None:
-    config.JobType.pyCfgParams = list(RECOVERY_PYCFG_PARAMS)
-if RECOVERY_PYCFG_PARAMS_APPEND:
+if RECOVERY_PYCFG_PARAM_OVERRIDES:
     base = list(getattr(config.JobType, "pyCfgParams", []))
-    config.JobType.pyCfgParams = base + list(RECOVERY_PYCFG_PARAMS_APPEND)
+    config.JobType.pyCfgParams = merge_pycfg_params(
+        base, RECOVERY_PYCFG_PARAM_OVERRIDES
+    )
 
 for dotted_path, value in RECOVERY_OVERRIDES.items():
     apply_dotted_override(config, dotted_path, value)
