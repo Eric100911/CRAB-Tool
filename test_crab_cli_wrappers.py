@@ -21,6 +21,47 @@ STATUS_SNAPSHOT_PY = SCRIPT_DIR / "crab_status_snapshot.py"
 RECOVERY_BUILDER_PY = SCRIPT_DIR / "crab_recovery_task_builder.py"
 
 
+def install_fake_wmcore(root: Path) -> None:
+    wmcore_dir = root / "WMCore"
+    wmcore_dir.mkdir()
+    (wmcore_dir / "__init__.py").write_text("")
+    (wmcore_dir / "Configuration.py").write_text(
+        "from types import SimpleNamespace\n"
+        "\n"
+        "class Configuration:\n"
+        "    def section_(self, name):\n"
+        "        section = SimpleNamespace()\n"
+        "        setattr(self, name, section)\n"
+        "        return section\n"
+    )
+
+
+def write_original_cfg(path: Path, original_lumi_mask: Path) -> None:
+    path.write_text(
+        "from WMCore.Configuration import Configuration\n"
+        "config = Configuration()\n"
+        "config.section_('General')\n"
+        f"config.General.requestName = '{path.stem}'\n"
+        "config.section_('JobType')\n"
+        "config.JobType.outputFiles = ['sample.root']\n"
+        "config.JobType.pyCfgParams = [\n"
+        "    'runOnMC=False',\n"
+        "    'era=Run2022E',\n"
+        "    'outputFile=sample.root',\n"
+        "    'analysisMode=JpsiJpsiPhi',\n"
+        "]\n"
+        "config.JobType.numCores = 1\n"
+        "config.JobType.maxMemoryMB = 2000\n"
+        "config.section_('Data')\n"
+        "config.Data.splitting = 'LumiBased'\n"
+        "config.Data.unitsPerJob = 50\n"
+        "config.Data.publication = False\n"
+        f"config.Data.lumiMask = '{original_lumi_mask}'\n"
+        "config.section_('Site')\n"
+        "config.Site.storageSite = 'T2_TEST_SITE'\n"
+    )
+
+
 def make_fake_tools(root: Path) -> tuple[Path, Path]:
     fake_bin = root / "bin"
     fake_bin.mkdir()
@@ -31,7 +72,43 @@ def make_fake_tools(root: Path) -> tuple[Path, Path]:
     crab_script = fake_bin / "crab"
     crab_script.write_text(
         "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
         "printf '%s\\n' \"$*\" >> \"${FAKE_CRAB_LOG}\"\n"
+        "cmd=\"${1:-}\"\n"
+        "shift || true\n"
+        "case \"${cmd}\" in\n"
+        "  status)\n"
+        "    if [[ -n \"${FAKE_CRAB_STATUS_OUTPUT:-}\" ]]; then\n"
+        "      printf '%b' \"${FAKE_CRAB_STATUS_OUTPUT}\"\n"
+        "    fi\n"
+        "    ;;\n"
+        "  report)\n"
+        "    task_path=\"\"\n"
+        "    while (($#)); do\n"
+        "      if [[ \"$1\" == \"-d\" && $# -ge 2 ]]; then\n"
+        "        task_path=\"$2\"\n"
+        "        shift 2\n"
+        "        continue\n"
+        "      fi\n"
+        "      shift\n"
+        "    done\n"
+        "    if [[ -n \"${task_path}\" ]]; then\n"
+        "      mkdir -p \"${task_path}/results\"\n"
+        "    fi\n"
+        "    case \"${FAKE_CRAB_REPORT_MODE:-}\" in\n"
+        "      with_not_finished)\n"
+        "        if [[ -n \"${task_path}\" ]]; then\n"
+        "          printf '%s\\n' '{\"1\": [[1, 5]]}' > \"${task_path}/results/notFinishedLumis.json\"\n"
+        "        fi\n"
+        "        ;;\n"
+        "      no_not_finished)\n"
+        "        if [[ -n \"${task_path}\" ]]; then\n"
+        "          printf '%s\\n' '{\"1\": [[1, 5]]}' > \"${task_path}/results/lumisToProcess.json\"\n"
+        "        fi\n"
+        "        ;;\n"
+        "    esac\n"
+        "    ;;\n"
+        "esac\n"
         "exit 0\n"
     )
     crab_script.chmod(0o755)
@@ -47,6 +124,99 @@ def make_fake_tools(root: Path) -> tuple[Path, Path]:
     )
     proxy_script.chmod(0o755)
     return proxy_path, crab_log
+
+
+def make_recovery_state(
+    tmp: Path,
+    status_cache_dir: Path,
+    recovery_cache_dir: Path,
+    *,
+    classification: str,
+    job_states: dict[str, int],
+    has_child_attempt: bool = False,
+) -> tuple[Path, Path, Path]:
+    install_fake_wmcore(tmp)
+    cfg_path = tmp / "sample_cfg.py"
+    original_lumi_mask = tmp / "original_lumi_mask.json"
+    original_lumi_mask.write_text("{}\n")
+    write_original_cfg(cfg_path, original_lumi_mask)
+    task_path = tmp / "crab_sample_cfg"
+    task_path.mkdir()
+    report_dir = recovery_cache_dir / "reports" / "crab_sample_cfg"
+    recover_cfg = recovery_cache_dir / "configs" / "sample_cfg__recover1.py"
+    state_path = status_cache_dir / "latest_state.json"
+    status_cache_dir.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps(
+            {
+                "cwd": str(tmp),
+                "families": {
+                    "crab_sample_cfg": {
+                        "root_task_dir": "crab_sample_cfg",
+                        "root_cfg": str(cfg_path),
+                        "attempt_order": ["crab_sample_cfg"]
+                        if not has_child_attempt
+                        else ["crab_sample_cfg", "crab_sample_cfg__recover1"],
+                        "latest_attempt_id": "crab_sample_cfg"
+                        if not has_child_attempt
+                        else "crab_sample_cfg__recover1",
+                    }
+                },
+                "attempts": {
+                    "crab_sample_cfg": {
+                        "task_dir": "crab_sample_cfg",
+                        "task_path": str(task_path),
+                        "cfg": str(cfg_path),
+                        "cfg_path": str(cfg_path),
+                        "request_name": "sample_cfg",
+                        "family_id": "crab_sample_cfg",
+                        "parent_attempt_id": None,
+                        "generation": 0,
+                        "planned_lumi_mask": str(original_lumi_mask),
+                        "planned_lumi_source": "original_task_lumi_mask",
+                        "original_lumi_mask": str(original_lumi_mask),
+                        "status_revision": "sha256:test",
+                        "status": {
+                            "status_collection_state": "ok_json",
+                            "job_states": job_states,
+                            "failed_job_count": 0,
+                            "failed_job_ids": [],
+                            "jobs": {},
+                        },
+                        "recovery": {
+                            "classification": classification,
+                            "derived_from_revision": "sha256:test",
+                            "executable": not has_child_attempt,
+                            "has_child_attempt": has_child_attempt,
+                            "resolved_lumi_action": None,
+                            "resolved_lumi_source": None,
+                            "resolved_lumi_mask": None,
+                        },
+                        "artifacts": {
+                            "report_dir": str(report_dir),
+                            "preserved_not_finished_lumis": str(
+                                report_dir / "notFinishedLumis.json"
+                            ),
+                            "task_not_finished_lumis": str(
+                                task_path / "results" / "notFinishedLumis.json"
+                            ),
+                            "task_processed_lumis": str(
+                                task_path / "results" / "processedLumis.json"
+                            ),
+                            "task_lumis_to_process": str(
+                                task_path / "results" / "lumisToProcess.json"
+                            ),
+                            "next_recover_cfg": str(recover_cfg),
+                            "next_recover_request_name": "sample_cfg__recover1",
+                            "next_child_task_dir": "crab_sample_cfg__recover1",
+                            "next_child_task_path": str(tmp / "crab_sample_cfg__recover1"),
+                        },
+                    }
+                },
+            }
+        )
+    )
+    return cfg_path, task_path, state_path
 
 
 class CrabCliWrapperTest(unittest.TestCase):
@@ -185,18 +355,20 @@ class CrabCliWrapperTest(unittest.TestCase):
             task_dir = tmp / "crab_sample_cfg"
             status_cache_dir = tmp / "status_cache"
             status_cache_dir.mkdir()
-            summary_path = status_cache_dir / "latest_summary.json"
-            summary_path.write_text(
+            state_path = status_cache_dir / "latest_state.json"
+            state_path.write_text(
                 json.dumps(
                     {
                         "query_failures": [],
-                        "tasks": [
-                            {
+                        "attempts": {
+                            str(task_dir): {
                                 "task_dir": str(task_dir),
-                                "failed_job_ids": ["7", "9"],
-                                "failed_job_count": 2,
+                                "status": {
+                                    "failed_job_ids": ["7", "9"],
+                                    "failed_job_count": 2,
+                                },
                             }
-                        ],
+                        },
                     }
                 )
             )
@@ -258,23 +430,48 @@ class CrabCliWrapperTest(unittest.TestCase):
             manifest_path.write_text(f"{cfg_path}\n")
             recovery_cache_dir = tmp / "recovery_cache"
             recovery_cache_dir.mkdir()
+            status_cache_dir = tmp / "status_cache"
+            status_cache_dir.mkdir()
             task_path = tmp / "crab_sample_cfg"
-            plan_path = recovery_cache_dir / "latest_recovery_plan.json"
-            plan_path.write_text(
+            state_path = status_cache_dir / "latest_state.json"
+            state_path.write_text(
                 json.dumps(
                     {
-                        "tasks": [
-                            {
+                        "families": {
+                            "crab_sample_cfg": {
+                                "root_task_dir": "crab_sample_cfg",
+                                "root_cfg": str(cfg_path),
+                                "attempt_order": ["crab_sample_cfg"],
+                                "latest_attempt_id": "crab_sample_cfg",
+                            }
+                        },
+                        "attempts": {
+                            "crab_sample_cfg": {
                                 "task_dir": "crab_sample_cfg",
                                 "task_path": str(task_path),
-                                "report_dir": str(recovery_cache_dir / "reports" / "crab_sample_cfg"),
-                                "preserved_not_finished_lumis": str(
-                                    recovery_cache_dir / "reports" / "crab_sample_cfg" / "notFinishedLumis.json"
-                                ),
-                                "recover_cfg": str(recovery_cache_dir / "configs" / "sample__recover1.py"),
-                                "classification": "recovery_candidate",
+                                "cfg": str(cfg_path),
+                                "cfg_path": str(cfg_path),
+                                "request_name": "sample_cfg",
+                                "family_id": "crab_sample_cfg",
+                                "generation": 0,
+                                "planned_lumi_mask": str(tmp / "original.json"),
+                                "status_revision": "sha256:test",
+                                "status": {"status_collection_state": "ok_json", "job_states": {"idle": 1}, "jobs": {}},
+                                "recovery": {
+                                    "classification": "recovery_candidate",
+                                    "derived_from_revision": "sha256:test",
+                                    "executable": True,
+                                    "has_child_attempt": False,
+                                },
+                                "artifacts": {
+                                    "report_dir": str(recovery_cache_dir / "reports" / "crab_sample_cfg"),
+                                    "preserved_not_finished_lumis": str(
+                                        recovery_cache_dir / "reports" / "crab_sample_cfg" / "notFinishedLumis.json"
+                                    ),
+                                    "next_recover_cfg": str(recovery_cache_dir / "configs" / "sample__recover1.py"),
+                                },
                             }
-                        ]
+                        },
                     }
                 )
             )
@@ -300,6 +497,8 @@ class CrabCliWrapperTest(unittest.TestCase):
                     "--use-prepared-plan",
                     "--manifest",
                     str(manifest_path),
+                    "--status-cache-dir",
+                    str(status_cache_dir),
                     "--recovery-cache-dir",
                     str(recovery_cache_dir),
                 ],
@@ -322,23 +521,48 @@ class CrabCliWrapperTest(unittest.TestCase):
             manifest_path.write_text(f"{cfg_path}\n")
             recovery_cache_dir = tmp / "recovery_cache"
             recovery_cache_dir.mkdir()
+            status_cache_dir = tmp / "status_cache"
+            status_cache_dir.mkdir()
             task_path = tmp / "crab_sample_cfg"
-            plan_path = recovery_cache_dir / "latest_recovery_plan.json"
-            plan_path.write_text(
+            state_path = status_cache_dir / "latest_state.json"
+            state_path.write_text(
                 json.dumps(
                     {
-                        "tasks": [
-                            {
+                        "families": {
+                            "crab_sample_cfg": {
+                                "root_task_dir": "crab_sample_cfg",
+                                "root_cfg": str(cfg_path),
+                                "attempt_order": ["crab_sample_cfg"],
+                                "latest_attempt_id": "crab_sample_cfg",
+                            }
+                        },
+                        "attempts": {
+                            "crab_sample_cfg": {
                                 "task_dir": "crab_sample_cfg",
                                 "task_path": str(task_path),
-                                "report_dir": str(recovery_cache_dir / "reports" / "crab_sample_cfg"),
-                                "preserved_not_finished_lumis": str(
-                                    recovery_cache_dir / "reports" / "crab_sample_cfg" / "notFinishedLumis.json"
-                                ),
-                                "recover_cfg": str(recovery_cache_dir / "configs" / "sample__recover1.py"),
-                                "classification": "killed_recovery_candidate",
+                                "cfg": str(cfg_path),
+                                "cfg_path": str(cfg_path),
+                                "request_name": "sample_cfg",
+                                "family_id": "crab_sample_cfg",
+                                "generation": 0,
+                                "planned_lumi_mask": str(tmp / "original.json"),
+                                "status_revision": "sha256:test",
+                                "status": {"status_collection_state": "ok_json", "job_states": {"idle": 1}, "jobs": {}},
+                                "recovery": {
+                                    "classification": "killed_recovery_candidate",
+                                    "derived_from_revision": "sha256:test",
+                                    "executable": True,
+                                    "has_child_attempt": False,
+                                },
+                                "artifacts": {
+                                    "report_dir": str(recovery_cache_dir / "reports" / "crab_sample_cfg"),
+                                    "preserved_not_finished_lumis": str(
+                                        recovery_cache_dir / "reports" / "crab_sample_cfg" / "notFinishedLumis.json"
+                                    ),
+                                    "next_recover_cfg": str(recovery_cache_dir / "configs" / "sample__recover1.py"),
+                                },
                             }
-                        ]
+                        },
                     }
                 )
             )
@@ -364,6 +588,8 @@ class CrabCliWrapperTest(unittest.TestCase):
                     "--use-prepared-plan",
                     "--manifest",
                     str(manifest_path),
+                    "--status-cache-dir",
+                    str(status_cache_dir),
                     "--recovery-cache-dir",
                     str(recovery_cache_dir),
                 ],
@@ -374,6 +600,133 @@ class CrabCliWrapperTest(unittest.TestCase):
             self.assertGreaterEqual(len(lines), 5)
             self.assertIn("preserve-if-present", lines[0])
             self.assertNotIn("crab kill -d", completed.stdout)
+
+    def test_kill_recover_execute_falls_back_to_original_mask_when_report_has_no_not_finished_and_no_jobs_finished(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            proxy_path, crab_log = make_fake_tools(tmp)
+            manifest_path = tmp / "manifest.txt"
+            recovery_cache_dir = tmp / "recovery_cache"
+            recovery_cache_dir.mkdir()
+            status_cache_dir = tmp / "status_cache"
+            cfg_path, task_path, state_path = make_recovery_state(
+                tmp,
+                status_cache_dir,
+                recovery_cache_dir,
+                classification="recovery_candidate",
+                job_states={"idle": 565},
+            )
+            manifest_path.write_text(f"{cfg_path}\n")
+
+            env = self.base_env()
+            env.update(
+                {
+                    "PATH": f"{tmp / 'bin'}:{env['PATH']}",
+                    "PYTHONPATH": f"{tmp}:{env.get('PYTHONPATH', '')}",
+                    "X509_USER_PROXY": str(proxy_path),
+                    "FAKE_PROXY_PATH": str(proxy_path),
+                    "FAKE_CRAB_LOG": str(crab_log),
+                    "FAKE_CRAB_STATUS_OUTPUT": "Status on the CRAB server:\tSUBMITTED\n",
+                    "FAKE_CRAB_REPORT_MODE": "no_not_finished",
+                    "CMSSW_BASE": "/tmp/cmssw",
+                    "CMSSW_RELEASE_BASE": "/tmp/cmssw_release",
+                    "SCRAM_ARCH": "el9_amd64_gcc13",
+                }
+            )
+
+            completed = self.run_command(
+                [
+                    "bash",
+                    str(KILL_RECOVER_SH),
+                    "--execute",
+                    "--use-prepared-plan",
+                    "--manifest",
+                    str(manifest_path),
+                    "--status-cache-dir",
+                    str(status_cache_dir),
+                    "--recovery-cache-dir",
+                    str(recovery_cache_dir),
+                ],
+                env=env,
+            )
+            self.assertEqual(completed.returncode, 0, msg=completed.stderr)
+            self.assertIn("No notFinishedLumis.json produced", completed.stderr)
+
+            crab_commands = crab_log.read_text()
+            self.assertIn(f"status -d {task_path}", crab_commands)
+            self.assertIn(f"report -d {task_path}", crab_commands)
+            self.assertIn(f"kill -d {task_path}", crab_commands)
+            self.assertIn(
+                f"submit -c {recovery_cache_dir / 'configs' / 'sample_cfg__recover1.py'}",
+                crab_commands,
+            )
+
+            state = json.loads(state_path.read_text())
+            task = state["attempts"]["crab_sample_cfg"]
+            self.assertEqual(task["recovery"]["resolved_lumi_source"], "parent_planned_lumi_mask_no_finished_jobs")
+            self.assertEqual(task["recovery"]["resolved_lumi_mask"], str(tmp / "original_lumi_mask.json"))
+
+    def test_kill_recover_execute_skips_report_and_kill_when_runtime_status_is_killed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            proxy_path, crab_log = make_fake_tools(tmp)
+            manifest_path = tmp / "manifest.txt"
+            recovery_cache_dir = tmp / "recovery_cache"
+            recovery_cache_dir.mkdir()
+            status_cache_dir = tmp / "status_cache"
+            cfg_path, task_path, state_path = make_recovery_state(
+                tmp,
+                status_cache_dir,
+                recovery_cache_dir,
+                classification="recovery_candidate",
+                job_states={"idle": 565},
+            )
+            manifest_path.write_text(f"{cfg_path}\n")
+
+            env = self.base_env()
+            env.update(
+                {
+                    "PATH": f"{tmp / 'bin'}:{env['PATH']}",
+                    "PYTHONPATH": f"{tmp}:{env.get('PYTHONPATH', '')}",
+                    "X509_USER_PROXY": str(proxy_path),
+                    "FAKE_PROXY_PATH": str(proxy_path),
+                    "FAKE_CRAB_LOG": str(crab_log),
+                    "FAKE_CRAB_STATUS_OUTPUT": "Status on the CRAB server:\tKILLED\n",
+                    "CMSSW_BASE": "/tmp/cmssw",
+                    "CMSSW_RELEASE_BASE": "/tmp/cmssw_release",
+                    "SCRAM_ARCH": "el9_amd64_gcc13",
+                }
+            )
+
+            completed = self.run_command(
+                [
+                    "bash",
+                    str(KILL_RECOVER_SH),
+                    "--execute",
+                    "--use-prepared-plan",
+                    "--manifest",
+                    str(manifest_path),
+                    "--status-cache-dir",
+                    str(status_cache_dir),
+                    "--recovery-cache-dir",
+                    str(recovery_cache_dir),
+                ],
+                env=env,
+            )
+            self.assertEqual(completed.returncode, 0, msg=completed.stderr)
+
+            crab_commands = crab_log.read_text()
+            self.assertIn(f"status -d {task_path}", crab_commands)
+            self.assertNotIn(f"report -d {task_path}", crab_commands)
+            self.assertNotIn(f"kill -d {task_path}", crab_commands)
+            self.assertIn(
+                f"submit -c {recovery_cache_dir / 'configs' / 'sample_cfg__recover1.py'}",
+                crab_commands,
+            )
+
+            state = json.loads(state_path.read_text())
+            task = state["attempts"]["crab_sample_cfg"]
+            self.assertEqual(task["recovery"]["resolved_lumi_source"], "parent_planned_lumi_mask_killed")
 
 
 if __name__ == "__main__":

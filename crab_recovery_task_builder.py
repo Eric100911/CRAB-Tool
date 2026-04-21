@@ -1,4 +1,14 @@
 #!/usr/bin/env python3
+"""Compatibility wrapper for the unified recovery state builder."""
+
+from crab_recovery_state_builder import *  # noqa: F401,F403
+from crab_recovery_state_builder import main as state_builder_main
+
+
+if __name__ == "__main__":
+    raise SystemExit(state_builder_main())
+
+'''
 """Build recovery plans, lineage metadata, and recovery configs for CRAB tasks."""
 
 from __future__ import annotations
@@ -729,6 +739,22 @@ def find_task(plan: dict[str, Any], task_dir: str) -> dict[str, Any]:
     raise KeyError(f"Task {task_dir} is not present in recovery plan.")
 
 
+def finished_job_count(task: dict[str, Any]) -> int:
+    job_states = task.get("job_states") or {}
+    raw_value = job_states.get("finished", 0)
+    try:
+        return int(raw_value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def has_explicit_zero_finished_jobs(task: dict[str, Any]) -> bool:
+    job_states = task.get("job_states")
+    if not isinstance(job_states, dict) or not job_states:
+        return False
+    return finished_job_count(task) == 0
+
+
 def resolve_lumi_for_task(task: dict[str, Any]) -> tuple[str, str, str]:
     preserved_not_finished_lumis = Path(task["preserved_not_finished_lumis"]).resolve()
     task_not_finished_lumis = Path(task["task_not_finished_lumis"]).resolve()
@@ -748,6 +774,9 @@ def resolve_lumi_for_task(task: dict[str, Any]) -> tuple[str, str, str]:
 
     if task["classification"] == "killed_recovery_candidate" and original_lumi_mask:
         return "submit", "original_lumi_mask_fallback", str(original_lumi_mask)
+
+    if has_explicit_zero_finished_jobs(task) and original_lumi_mask:
+        return "submit", "original_lumi_mask_no_finished_jobs", str(original_lumi_mask)
 
     return "error", "missing_not_finished_lumis", ""
 
@@ -936,3 +965,4 @@ if __name__ == "__main__":
     except Exception as exc:  # pragma: no cover - CLI error reporting
         print(str(exc), file=sys.stderr)
         raise SystemExit(1)
+'''

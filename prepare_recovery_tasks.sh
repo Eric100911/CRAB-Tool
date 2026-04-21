@@ -9,7 +9,7 @@ MANIFEST="${CRAB_MANIFEST:-generated_crab_configs.txt}"
 CLI_USE_CACHED_STATUS=""
 STATUS_CACHE_DIR="${STATUS_CACHE_DIR:-status_cache}"
 RECOVERY_CACHE_DIR="${RECOVERY_CACHE_DIR:-recovery_cache}"
-SUMMARY_FILE="${STATUS_CACHE_DIR}/latest_summary.json"
+STATE_FILE="${STATUS_CACHE_DIR}/latest_state.json"
 STUCK_HOURS="${STUCK_HOURS:-48}"
 SHOW_HELP=0
 
@@ -17,9 +17,8 @@ show_help() {
     cat <<'EOF'
 Usage: ./prepare_recovery_tasks.sh [options]
 
-Refresh or reuse the cached CRAB task status, build a recovery plan for stuck
-unfinished jobs, write lineage metadata, and render the recovery configs under
-recovery_cache/.
+Refresh or reuse the cached CRAB task status, refresh derived recovery metadata
+in the unified state file, and render the recovery configs under recovery_cache/.
 
 Options:
   -h, --help              Show this help text and exit.
@@ -47,9 +46,7 @@ Examples:
   ./prepare_recovery_tasks.sh --use-cached-status --stuck-hours 72
 
 Outputs:
-  recovery_cache/latest_recovery_plan.json
-  recovery_cache/task_lineage.json
-  recovery_cache/tracked_configs.txt
+  status_cache/latest_state.json
   recovery_cache/generated_recovery_configs.txt
 EOF
 }
@@ -100,20 +97,20 @@ if [[ "${SHOW_HELP}" == "1" ]]; then
 fi
 
 USE_CACHED_STATUS="$(resolve_bool "USE_CACHED_STATUS" "${CLI_USE_CACHED_STATUS}" "${USE_CACHED_STATUS:-}" "0")"
-SUMMARY_FILE="${STATUS_CACHE_DIR}/latest_summary.json"
+STATE_FILE="${STATUS_CACHE_DIR}/latest_state.json"
 
 require_cmssw_env
 require_manifest "${MANIFEST}"
 require_proxy_env
 
-if [[ "${USE_CACHED_STATUS}" != "1" || ! -f "${SUMMARY_FILE}" ]]; then
+if [[ "${USE_CACHED_STATUS}" != "1" || ! -f "${STATE_FILE}" ]]; then
     ./status.sh --manifest "${MANIFEST}" --cache-dir "${STATUS_CACHE_DIR}"
 fi
 
-python3 crab_recovery_task_builder.py plan \
-    --summary-file "${SUMMARY_FILE}" \
+python3 crab_recovery_task_builder.py refresh-recovery \
+    --state-file "${STATE_FILE}" \
     --output-dir "${RECOVERY_CACHE_DIR}" \
     --stuck-hours "${STUCK_HOURS}"
 
 python3 crab_recovery_task_builder.py render-all \
-    --plan-file "${RECOVERY_CACHE_DIR}/latest_recovery_plan.json"
+    --state-file "${STATE_FILE}"

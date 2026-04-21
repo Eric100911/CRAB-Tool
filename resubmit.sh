@@ -9,7 +9,7 @@ MANIFEST="${CRAB_MANIFEST:-generated_crab_configs.txt}"
 CLI_DRY_RUN=""
 CLI_USE_CACHED_STATUS=""
 STATUS_CACHE_DIR="${STATUS_CACHE_DIR:-status_cache}"
-SUMMARY_FILE="${STATUS_CACHE_DIR}/latest_summary.json"
+STATE_FILE="${STATUS_CACHE_DIR}/latest_state.json"
 SHOW_HELP=0
 declare -a FORWARD_ARGS=()
 
@@ -30,7 +30,7 @@ show_help() {
 Usage: ./resubmit.sh [options] [-- crab resubmit options]
 
 Refresh the cached task status if needed, then resubmit only the failed CRAB
-jobs for tasks that currently contain failures.
+jobs for tasks that currently contain failures in the unified state file.
 
 Options:
   -h, --help              Show this help text and exit.
@@ -110,18 +110,18 @@ fi
 
 DRY_RUN="$(resolve_bool "DRY_RUN" "${CLI_DRY_RUN}" "${DRY_RUN:-}" "1")"
 USE_CACHED_STATUS="$(resolve_bool "USE_CACHED_STATUS" "${CLI_USE_CACHED_STATUS}" "${USE_CACHED_STATUS:-}" "0")"
-SUMMARY_FILE="${STATUS_CACHE_DIR}/latest_summary.json"
+STATE_FILE="${STATUS_CACHE_DIR}/latest_state.json"
 
 require_cmssw_env
 require_manifest "${MANIFEST}"
 require_proxy_env
 
-if [[ "${USE_CACHED_STATUS}" != "1" || ! -f "${SUMMARY_FILE}" ]]; then
+if [[ "${USE_CACHED_STATUS}" != "1" || ! -f "${STATE_FILE}" ]]; then
     ./status.sh --manifest "${MANIFEST}" --cache-dir "${STATUS_CACHE_DIR}"
 fi
 
 if ! failed_output="$(
-    python3 crab_status_snapshot.py list-failed --summary-file "${SUMMARY_FILE}"
+    python3 crab_status_snapshot.py list-failed --state-file "${STATE_FILE}"
 )"; then
     exit 1
 fi

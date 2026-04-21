@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+from test_crab_recovery_state_builder_v2 import *  # noqa: F401,F403
+
+'''
 """Unit tests for crab_recovery_task_builder.py."""
 
 from __future__ import annotations
@@ -458,6 +461,55 @@ class CrabRecoveryTaskBuilderTest(unittest.TestCase):
             )
             self.assertEqual((action, source, path), ("error", "missing_not_finished_lumis", ""))
 
+    def test_resolve_lumi_falls_back_to_original_mask_when_no_jobs_finished(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+
+            action, source, path = builder.resolve_lumi_for_task(
+                {
+                    "classification": "recovery_candidate",
+                    "job_states": {"idle": 565},
+                    "preserved_not_finished_lumis": str(tmp / "report" / "notFinishedLumis.json"),
+                    "task_not_finished_lumis": str(tmp / "task_results" / "notFinishedLumis.json"),
+                    "original_lumi_mask": "/tmp/chiw/original.json",
+                }
+            )
+            self.assertEqual(
+                (action, source, path),
+                ("submit", "original_lumi_mask_no_finished_jobs", "/tmp/chiw/original.json"),
+            )
+
+    def test_resolve_lumi_keeps_failing_when_some_jobs_finished_but_not_finished_lumis_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+
+            action, source, path = builder.resolve_lumi_for_task(
+                {
+                    "classification": "recovery_candidate",
+                    "job_states": {"finished": 1, "idle": 10},
+                    "preserved_not_finished_lumis": str(tmp / "report" / "notFinishedLumis.json"),
+                    "task_not_finished_lumis": str(tmp / "task_results" / "notFinishedLumis.json"),
+                    "original_lumi_mask": "/tmp/chiw/original.json",
+                }
+            )
+            self.assertEqual((action, source, path), ("error", "missing_not_finished_lumis", ""))
+
+    def test_resolve_lumi_does_not_assume_zero_finished_when_job_states_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+
+            action, source, path = builder.resolve_lumi_for_task(
+                {
+                    "classification": "recovery_candidate",
+                    "job_states": {},
+                    "preserved_not_finished_lumis": str(tmp / "report" / "notFinishedLumis.json"),
+                    "task_not_finished_lumis": str(tmp / "task_results" / "notFinishedLumis.json"),
+                    "original_lumi_mask": "/tmp/chiw/original.json",
+                }
+            )
+            self.assertEqual((action, source, path), ("error", "missing_not_finished_lumis", ""))
+
 
 if __name__ == "__main__":
     unittest.main()
+'''

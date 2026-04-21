@@ -147,8 +147,7 @@ Key options:
 
 Outputs:
 
-- `status_cache/latest_summary.json`
-- `status_cache/tasks/*.json`
+- `status_cache/latest_state.json`
 
 ### `resubmit.sh`
 
@@ -168,7 +167,8 @@ Key options:
 
 ### `prepare_recovery_tasks.sh`
 
-Build a recovery plan and render recovery configs for stuck unfinished jobs.
+Refresh derived recovery metadata in the unified state file and render recovery
+configs for stuck unfinished jobs.
 
 ```bash
 ./prepare_recovery_tasks.sh [options]
@@ -184,9 +184,7 @@ Key options:
 
 Outputs:
 
-- `recovery_cache/latest_recovery_plan.json`
-- `recovery_cache/task_lineage.json`
-- `recovery_cache/tracked_configs.txt`
+- `status_cache/latest_state.json`
 - `recovery_cache/generated_recovery_configs.txt`
 - `recovery_cache/configs/*.py`
 
@@ -212,10 +210,15 @@ Recovery overrides:
   `results/notFinishedLumis.json` into `recovery_cache/reports/<task>/` before
   the original task is killed. The rendered recovery config then uses that
   preserved file as its lumi mask.
+- The execution wrapper re-checks the live CRAB server status before deciding
+  whether a task should follow the normal `report -> kill` path or the
+  already-killed fallback path, even when `--use-cached-status` and
+  `--use-prepared-plan` are enabled.
 
 ### `kill_unfinished_and_submit_recover.sh`
 
-Execute the recovery flow selected by the recovery plan.
+Execute the recovery flow selected by the recovery metadata stored in
+`status_cache/latest_state.json`.
 
 ```bash
 ./kill_unfinished_and_submit_recover.sh [options]
@@ -258,8 +261,8 @@ Generate CRAB config files from the local dataset lists.
 
 ### `crab_status_snapshot.py`
 
-Collect cached CRAB status JSON payloads or list failed jobs from a saved
-summary.
+Collect cached CRAB status into the authoritative state file or list failed
+jobs from that state file.
 
 ```bash
 ./crab_status_snapshot.py --help
@@ -275,12 +278,12 @@ task_dir<TAB>comma-separated job ids<TAB>failed job count
 
 ### `crab_recovery_task_builder.py`
 
-Build recovery plans, keep recovery lineage metadata, resolve lumi-mask
-fallbacks, render recovery configs, or list executable recovery tasks.
+Refresh recovery metadata in the state file, resolve lumi-mask fallbacks,
+render recovery configs, or list executable recovery tasks.
 
 ```bash
 ./crab_recovery_task_builder.py --help
-./crab_recovery_task_builder.py plan --help
+./crab_recovery_task_builder.py refresh-recovery --help
 ./crab_recovery_task_builder.py render-all --help
 ./crab_recovery_task_builder.py resolve-lumi-mask --help
 ```
@@ -288,13 +291,13 @@ fallbacks, render recovery configs, or list executable recovery tasks.
 `list-executable` prints:
 
 ```text
-task_dir<TAB>task_path<TAB>report_dir<TAB>report_lumi_mask<TAB>recover_cfg<TAB>classification
+task_dir<TAB>task_path<TAB>report_dir<TAB>preserved_not_finished_lumis<TAB>recover_cfg<TAB>classification
 ```
 
 ## Recovery classification
 
-`prepare_recovery_tasks.sh` reads `status_cache/latest_summary.json` and
-classifies tasks into:
+`prepare_recovery_tasks.sh` reads and updates `status_cache/latest_state.json`
+and classifies the latest attempt in each recovery family into:
 
 - `recovery_candidate`: tasks whose `unsubmitted` jobs or sufficiently old
   `idle` / `cooloff` jobs should move to a recovery task immediately.
@@ -340,6 +343,17 @@ Examples:
 DRY_RUN=0 ./submit.sh
 ```
 
+## Cache model
+
+- `status_cache/latest_state.json` is the only authoritative cache file.
+- Each original task forms one recovery family.
+- Recovery ancestry is a strict linear chain, not a DAG.
+- Every attempt stores its own `planned_lumi_mask`; recovery-of-recovery falls
+  back to the parent attempt's planned mask rather than widening back to the
+  root task's full lumi mask.
+- `recovery_cache/` stores generated artifacts only: rendered configs and
+  preserved report files. It is no longer an independent state store.
+
 ## Notes
 
 - The dataset lists are copied locally into this directory so `crabData` remains
@@ -353,7 +367,7 @@ DRY_RUN=0 ./submit.sh
   stdout before summarizing job states.
 - A killed task may return only the CRAB header with `Status on the CRAB
   server: KILLED` and no JSON payload. The cached status flow now records that
-  as a non-fatal `header_only_killed` state instead of aborting recovery
+  as a non-fatal `header_only_killed` state instead of aborting recovery.
   planning.
 - Normal recovery tasks now follow the CRAB flow of `crab report` on the
   original task, preserving `results/notFinishedLumis.json` into
@@ -368,11 +382,14 @@ DRY_RUN=0 ./submit.sh
   `crab3_template.py` or the original task config.
 - `lumisToProcess.json` is informational and is not used as the recovery lumi
   mask. The normal recovery source is `notFinishedLumis.json`.
+- If a task has explicitly zero finished jobs and `crab report` therefore
+  cannot produce `notFinishedLumis.json`, the recovery flow falls back to the
+  original task lumi mask and resubmits the full original lumi scope.
 - If an already-killed task has no preserved or existing
   `results/notFinishedLumis.json`, the recovery flow falls back to the original
   task lumi mask and resubmits the full lumi set.
-- Recovery ancestry is tracked in `recovery_cache/task_lineage.json`. Generated
-  recovery request names use numbered descendants such as
-  `...__recover1`, `...__recover2`, and the lineage-aware manifest
-  `recovery_cache/tracked_configs.txt` is available for future status or
-  recovery passes that need to include submitted recovery configs.
+- Recovery lineage is stored inside `status_cache/latest_state.json` as one
+  family per root task plus a linear ordered attempt chain. Generated recovery
+  request names use numbered descendants such as `...__recover1`,
+  `...__recover2`, and later recoveries inherit the parent attempt's planned
+  lumi mask instead of widening back to the root task scope.

@@ -52,17 +52,40 @@ class CrabStatusSnapshotTest(unittest.TestCase):
 
     def test_list_failed_rejects_query_failures(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            summary_path = Path(tmpdir) / "latest_summary.json"
-            summary_path.write_text(
+            state_path = Path(tmpdir) / "latest_state.json"
+            state_path.write_text(
                 json.dumps(
                     {
                         "query_failures": ["crab_task_a"],
-                        "tasks": [],
+                        "attempts": {},
                     }
                 )
             )
-            args = type("Args", (), {"summary_file": str(summary_path)})
+            args = type("Args", (), {"state_file": str(state_path), "summary_file": None})
             self.assertEqual(snapshot.run_list_failed(args), 1)
+
+    def test_list_failed_reads_failed_jobs_from_state_attempts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "latest_state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "query_failures": [],
+                        "attempts": {
+                            "crab_task": {
+                                "task_dir": "crab_task",
+                                "status": {
+                                    "failed_job_ids": ["7", "9"],
+                                    "failed_job_count": 2,
+                                },
+                            }
+                        },
+                    }
+                )
+            )
+            args = type("Args", (), {"state_file": str(state_path), "summary_file": None})
+            with tempfile.TemporaryDirectory() as _:
+                self.assertEqual(snapshot.run_list_failed(args), 0)
 
     def test_build_task_summary_treats_killed_without_json_as_header_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -103,6 +126,46 @@ class CrabStatusSnapshotTest(unittest.TestCase):
             snapshot.task_dir_from_cfg(task_root, cfg),
             task_root / "crab_sample",
         )
+
+    def test_merge_attempt_status_clears_stale_resolved_lumi_mask(self) -> None:
+        summary, payload, *_rest = (
+            {
+                "cfg": "sample.py",
+                "task_dir": "crab_sample",
+                "task_path": "/tmp/crab_sample",
+                "task_name": "task",
+                "server_status": "SUBMITTED",
+                "scheduler_status": "SUBMITTED",
+                "dashboard_url": None,
+                "job_count": 1,
+                "job_states": {"finished": 1},
+                "failed_job_count": 0,
+                "failed_job_ids": [],
+                "status_collection_state": snapshot.STATUS_COLLECTION_OK,
+                "query_error": None,
+                "query_warning": None,
+            },
+            {"1": {"State": "finished"}},
+            "",
+            "",
+            [],
+        )
+        status = snapshot.make_status_payload(summary, payload)
+        attempt = snapshot.merge_attempt_status(
+            {
+                "request_name": "sample",
+                "recovery": {
+                    "derived_from_revision": "sha256:stale",
+                    "resolved_lumi_action": "submit",
+                    "resolved_lumi_source": "preserved_not_finished",
+                    "resolved_lumi_mask": "/tmp/chiw/mask.json",
+                },
+            },
+            "sample.py",
+            Path("/tmp/crab_sample"),
+            status,
+        )
+        self.assertIsNone(attempt["recovery"]["resolved_lumi_mask"])
 
 
 if __name__ == "__main__":

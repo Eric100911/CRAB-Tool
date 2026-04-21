@@ -7,6 +7,7 @@ source "${SCRIPT_DIR}/crab_common.sh"
 
 MANIFEST="${CRAB_MANIFEST:-generated_crab_configs.txt}"
 STATUS_CACHE_DIR="${STATUS_CACHE_DIR:-status_cache}"
+STATE_FILE="${STATUS_CACHE_DIR}/latest_state.json"
 CLI_RAW_STATUS=""
 SHOW_HELP=0
 declare -a FORWARD_ARGS=()
@@ -18,7 +19,8 @@ Usage: ./status.sh [options] [-- crab status options]
 Query CRAB status for every task in the manifest.
 
 By default this wrapper uses crab_status_snapshot.py collect to create a cached,
-machine-readable summary under status_cache/. Use --raw-status to call
+machine-readable state file under status_cache/latest_state.json. Use
+--raw-status to call
 "crab status" directly for each task instead.
 
 Options:
@@ -112,5 +114,5 @@ fi
 
 exec python3 crab_status_snapshot.py collect \
     --manifest "${MANIFEST}" \
-    --cache-dir "${STATUS_CACHE_DIR}" \
+    --state-file "${STATE_FILE}" \
     "${FORWARD_ARGS[@]}"
