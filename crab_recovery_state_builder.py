@@ -7,10 +7,20 @@ import argparse
 import json
 import os
 import re
+import runpy
 import sys
+from contextlib import contextmanager
 from datetime import datetime, timezone
+from FWCore.PythonUtilities.LumiList import LumiList
 from pathlib import Path
 from typing import Any
+
+from crab_recovery_chain import (
+    ChainAppendSpec,
+    append_after,
+    get_latest_task,
+    rebuild_chain_index,
+)
 
 TIME_THRESHOLD_STATES = {"idle", "cooloff"}
 NON_FINISHED_STATES = {
@@ -50,6 +60,109 @@ def ensure_cmssw_env() -> None:
             "CMSSW environment is not active. "
             f"Missing {missing_names}. Run 'cmsenv' first."
         )
+
+
+def normalize_local_lumi_path(
+    raw_value: str, *, base_dir: Path | None = None
+) -> Path:
+    if raw_value.startswith(("http://", "https://")):
+        raise ValueError(
+            "URL-based lumi masks are not supported by recovery-chain validation."
+        )
+    path = Path(raw_value)
+    if not path.is_absolute() and base_dir is not None:
+        path = (base_dir / path).resolve()
+    else:
+        path = path.resolve()
+    return path
+
+
+def _is_compact_list_dict(value: dict[Any, Any]) -> bool:
+    return all(
+        isinstance(ranges, list)
+        and all(
+            isinstance(pair, (list, tuple))
+            and len(pair) == 2
+            and all(isinstance(item, int) for item in pair)
+            for pair in ranges
+        )
+        for ranges in value.values()
+    )
+
+
+def _is_runs_and_lumis_dict(value: dict[Any, Any]) -> bool:
+    return all(
+        isinstance(lumis, list) and all(isinstance(item, int) for item in lumis)
+        for lumis in value.values()
+    )
+
+
+def _is_run_lumi_pair_list(value: list[Any]) -> bool:
+    return all(
+        isinstance(item, (list, tuple))
+        and len(item) == 2
+        and all(isinstance(part, int) for part in item)
+        for item in value
+    )
+
+
+def load_lumi_json_payload(path: Path) -> Any:
+    with path.open(encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def lumi_list_from_value(value: Any, *, base_dir: Path | None = None) -> LumiList:
+    if isinstance(value, LumiList):
+        return value
+    if isinstance(value, str):
+        payload = load_lumi_json_payload(
+            normalize_local_lumi_path(value, base_dir=base_dir)
+        )
+        return lumi_list_from_value(payload)
+    if isinstance(value, dict):
+        if _is_compact_list_dict(value):
+            return LumiList(compactList=value)
+        if _is_runs_and_lumis_dict(value):
+            return LumiList(runsAndLumis=value)
+        raise ValueError(f"Unsupported lumi-mask dict shape: {value!r}")
+    if isinstance(value, list):
+        if not _is_run_lumi_pair_list(value):
+            raise ValueError("List lumi masks must be a list of [run, lumi] pairs.")
+        return LumiList(lumis=value)
+    raise ValueError(f"Unsupported lumi mask value: {value!r}")
+
+
+def compact_lumi_dict(
+    value: Any, *, base_dir: Path | None = None
+) -> dict[str, list[list[int]]]:
+    lumi_list = lumi_list_from_value(value, base_dir=base_dir)
+    compact = lumi_list.getCompactList()
+    return {
+        str(run): [[int(pair[0]), int(pair[1])] for pair in ranges]
+        for run, ranges in sorted(compact.items(), key=lambda item: int(item[0]))
+    }
+
+
+def normalize_state_lumi_mask(
+    value: Any, *, base_dir: Path | None = None
+) -> dict[str, list[list[int]]] | None:
+    if value is None:
+        return None
+    return compact_lumi_dict(value, base_dir=base_dir)
+
+
+def exact_same_lumis(
+    left: Any,
+    right: Any,
+    *,
+    left_base: Path | None = None,
+    right_base: Path | None = None,
+) -> bool:
+    left_ll = LumiList(compactList=compact_lumi_dict(left, base_dir=left_base))
+    right_ll = LumiList(compactList=compact_lumi_dict(right, base_dir=right_base))
+    return not (left_ll - right_ll).getCompactList() and not (
+        right_ll - left_ll
+    ).getCompactList()
 
 
 def add_state_file_argument(parser: argparse.ArgumentParser) -> None:
@@ -183,6 +296,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     add_state_file_argument(record_parser)
     record_parser.add_argument("--task", required=True)
 
+    add_parser = subparsers.add_parser(
+        "add-to-chain",
+        help="Register an already-existing recovery child after exact lumi-coverage validation.",
+        formatter_class=HelpFormatter,
+    )
+    add_state_file_argument(add_parser)
+    add_parser.add_argument("--parent-task", required=True)
+    add_parser.add_argument("--child-task-dir", required=True)
+    add_parser.add_argument("--child-cfg", required=True)
+    add_parser.add_argument(
+        "--child-task-path",
+        default=None,
+        help="Explicit task path for the child. Defaults to <state cwd>/<child-task-dir>.",
+    )
+
     return parser.parse_args(argv)
 
 
@@ -249,6 +377,7 @@ def ensure_state_shape(state: dict[str, Any]) -> dict[str, Any]:
     merged.update(state)
     merged["families"] = dict(merged.get("families", {}))
     merged["attempts"] = dict(merged.get("attempts", {}))
+    lumi_base_dir = Path(str(merged.get("cwd") or Path.cwd())).resolve()
     for attempt_id, attempt in merged["attempts"].items():
         attempt.setdefault("task_dir", attempt_id)
         attempt.setdefault("cfg", attempt.get("cfg_path"))
@@ -266,12 +395,31 @@ def ensure_state_shape(state: dict[str, Any]) -> dict[str, Any]:
         attempt.setdefault("original_units_per_job", None)
         attempt.setdefault("publication_enabled", False)
         attempt.setdefault("original_output_dataset_tag", None)
+        attempt.setdefault("config_metadata", None)
         attempt.setdefault("status_revision", None)
         attempt.setdefault(
             "status", {"status_collection_state": STATUS_COLLECTION_NOT_COLLECTED}
         )
         attempt.setdefault("recovery", {})
         attempt.setdefault("artifacts", {})
+        if attempt.get("planned_lumi_mask") is not None:
+            attempt["planned_lumi_mask"] = normalize_state_lumi_mask(
+                attempt.get("planned_lumi_mask"), base_dir=lumi_base_dir
+            )
+        if attempt.get("original_lumi_mask") is not None:
+            attempt["original_lumi_mask"] = normalize_state_lumi_mask(
+                attempt.get("original_lumi_mask"), base_dir=lumi_base_dir
+            )
+        recovery = attempt.get("recovery", {})
+        if recovery.get("resolved_lumi_mask") is not None:
+            recovery["resolved_lumi_mask"] = normalize_state_lumi_mask(
+                recovery.get("resolved_lumi_mask"), base_dir=lumi_base_dir
+            )
+        config_metadata = attempt.get("config_metadata")
+        if isinstance(config_metadata, dict):
+            attempt["config_metadata"] = normalize_attempt_config_metadata(
+                config_metadata
+            )
     rebuild_families(merged)
     return merged
 
@@ -305,37 +453,7 @@ def build_recovery_request_name(
 
 
 def rebuild_families(state: dict[str, Any]) -> None:
-    grouped: dict[str, list[dict[str, Any]]] = {}
-    for attempt_id, attempt in state["attempts"].items():
-        attempt["task_dir"] = attempt_id
-        family_id = str(attempt.get("family_id") or attempt_id)
-        grouped.setdefault(family_id, []).append(attempt)
-
-    families: dict[str, Any] = {}
-    for _, attempts in grouped.items():
-        ordered = sorted(
-            attempts,
-            key=lambda attempt: (
-                int(attempt.get("generation", 0)),
-                str(attempt.get("request_name") or ""),
-                str(attempt.get("task_dir") or ""),
-            ),
-        )
-        root_attempt = next(
-            (attempt for attempt in ordered if int(attempt.get("generation", 0)) == 0),
-            ordered[0],
-        )
-        family_id = str(root_attempt["task_dir"])
-        for attempt in ordered:
-            attempt["family_id"] = family_id
-        families[family_id] = {
-            "root_task_dir": family_id,
-            "root_cfg": root_attempt.get("cfg"),
-            "attempt_order": [str(attempt["task_dir"]) for attempt in ordered],
-            "latest_attempt_id": str(ordered[-1]["task_dir"]),
-        }
-    state["families"] = families
-    state["task_count"] = len(state["attempts"])
+    rebuild_chain_index(state)
 
 
 def state_needs_legacy_migration(state_path: Path) -> bool:
@@ -512,58 +630,88 @@ def count_states(jobs: dict[str, dict[str, Any]], job_ids: set[str]) -> dict[str
     return dict(sorted(counts.items()))
 
 
-def extract_assignment(text: str, key: str) -> str | None:
-    match = re.search(rf"^\s*{re.escape(key)}\s*=\s*(.+?)\s*$", text, re.MULTILINE)
-    return match.group(1).strip() if match else None
-
-
-def ast_literal_eval(expr: str, cfg_path: Path, label: str) -> Any:
-    import ast
-
+@contextmanager
+def prepend_sys_path(path: Path):
+    resolved = str(path.resolve())
+    sys.path.insert(0, resolved)
     try:
-        return ast.literal_eval(expr)
-    except Exception as exc:
-        raise ValueError(f"Could not parse {label} from {cfg_path}: {exc}") from exc
+        yield
+    finally:
+        sys.path = [entry for entry in sys.path if entry != resolved]
 
 
-def parse_original_cfg_metadata(cfg_path: Path) -> dict[str, Any]:
-    text = cfg_path.read_text()
-
-    units_expr = extract_assignment(text, "config.Data.unitsPerJob")
-    if units_expr is None:
-        raise ValueError(f"Could not parse config.Data.unitsPerJob from {cfg_path}.")
-
-    publication_expr = extract_assignment(text, "config.Data.publication")
-    output_dataset_tag_expr = extract_assignment(
-        text, "config.Data.outputDatasetTag"
-    )
-    lumi_mask_expr = extract_assignment(text, "config.Data.lumiMask")
-
-    publication_enabled = False
-    if publication_expr is not None:
-        publication_enabled = bool(
-            ast_literal_eval(publication_expr, cfg_path, "config.Data.publication")
-        )
-
-    output_dataset_tag = None
-    if output_dataset_tag_expr is not None:
-        output_dataset_tag = ast_literal_eval(
-            output_dataset_tag_expr, cfg_path, "config.Data.outputDatasetTag"
-        )
-
-    lumi_mask = None
-    if lumi_mask_expr is not None:
-        lumi_mask = ast_literal_eval(
-            lumi_mask_expr, cfg_path, "config.Data.lumiMask"
-        )
-
-    units_per_job = ast_literal_eval(units_expr, cfg_path, "config.Data.unitsPerJob")
+def normalize_attempt_config_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    units_per_job = metadata.get("units_per_job")
+    if units_per_job is None:
+        raise ValueError("config_metadata is missing units_per_job.")
+    output_dataset_tag = metadata.get("output_dataset_tag")
     return {
         "units_per_job": int(units_per_job),
-        "publication_enabled": publication_enabled,
-        "output_dataset_tag": output_dataset_tag,
-        "lumi_mask": lumi_mask,
+        "publication_enabled": bool(metadata.get("publication_enabled", False)),
+        "output_dataset_tag": None
+        if output_dataset_tag is None
+        else str(output_dataset_tag),
     }
+
+
+def load_cfg_namespace(cfg_path: Path) -> dict[str, Any]:
+    with prepend_sys_path(cfg_path.parent):
+        return runpy.run_path(str(cfg_path))
+
+
+def load_cfg_metadata_via_runpy(cfg_path: Path) -> dict[str, Any]:
+    namespace = load_cfg_namespace(cfg_path)
+    config = namespace.get("config")
+    if config is None:
+        raise ValueError(f"Config object was not created in {cfg_path}.")
+
+    general = getattr(config, "General", None)
+    data = getattr(config, "Data", None)
+    if general is None or data is None:
+        raise ValueError(f"Config in {cfg_path} is missing General or Data sections.")
+
+    request_name = getattr(general, "requestName", None)
+    units_per_job = getattr(data, "unitsPerJob", None)
+    if request_name is None:
+        raise ValueError(f"Config in {cfg_path} is missing General.requestName.")
+    if units_per_job is None:
+        raise ValueError(f"Config in {cfg_path} is missing Data.unitsPerJob.")
+
+    return {
+        "request_name": str(request_name),
+        "units_per_job": int(units_per_job),
+        "publication_enabled": bool(getattr(data, "publication", False)),
+        "output_dataset_tag": getattr(data, "outputDatasetTag", None),
+        "lumi_mask": getattr(data, "lumiMask", None),
+    }
+
+
+def build_attempt_config_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    return normalize_attempt_config_metadata(
+        {
+            "units_per_job": metadata["units_per_job"],
+            "publication_enabled": metadata["publication_enabled"],
+            "output_dataset_tag": metadata["output_dataset_tag"],
+        }
+    )
+
+
+def attempt_config_metadata(attempt: dict[str, Any]) -> dict[str, Any] | None:
+    raw_metadata = attempt.get("config_metadata")
+    if isinstance(raw_metadata, dict) and raw_metadata:
+        return normalize_attempt_config_metadata(raw_metadata)
+
+    legacy_units = attempt.get("original_units_per_job")
+    if legacy_units is None:
+        return None
+
+    return normalize_attempt_config_metadata(
+        {
+            "units_per_job": legacy_units,
+            "publication_enabled": attempt.get("publication_enabled", False),
+            "output_dataset_tag": attempt.get("original_output_dataset_tag"),
+        }
+    )
 
 
 def infer_status_collection_state(task: dict[str, Any]) -> str:
@@ -587,19 +735,107 @@ def json_file_nonempty(path: Path) -> bool:
     return bool(data)
 
 
-def normalize_lumi_mask_value(raw_value: str) -> str:
-    if "://" in raw_value:
-        return raw_value
-    return str(Path(raw_value).resolve())
+def normalize_local_lumi_path(
+    raw_value: str, *, base_dir: Path | None = None
+) -> Path:
+    if raw_value.startswith(("http://", "https://")):
+        raise ValueError(
+            "URL-based lumi masks are not supported by recovery-chain validation."
+        )
+    path = Path(raw_value)
+    if not path.is_absolute() and base_dir is not None:
+        path = (base_dir / path).resolve()
+    else:
+        path = path.resolve()
+    return path
 
 
-def canonical_lumi_json(path: Path) -> str:
-    data = json.loads(path.read_text())
-    normalized = {
-        str(run): [list(pair) for pair in ranges]
-        for run, ranges in sorted(data.items(), key=lambda item: int(item[0]))
+def _is_compact_list_dict(value: dict[Any, Any]) -> bool:
+    return all(
+        isinstance(ranges, list)
+        and all(
+            isinstance(pair, (list, tuple))
+            and len(pair) == 2
+            and all(isinstance(item, int) for item in pair)
+            for pair in ranges
+        )
+        for ranges in value.values()
+    )
+
+
+def _is_runs_and_lumis_dict(value: dict[Any, Any]) -> bool:
+    return all(
+        isinstance(lumis, list) and all(isinstance(item, int) for item in lumis)
+        for lumis in value.values()
+    )
+
+
+def _is_run_lumi_pair_list(value: list[Any]) -> bool:
+    return all(
+        isinstance(item, (list, tuple))
+        and len(item) == 2
+        and all(isinstance(part, int) for part in item)
+        for item in value
+    )
+
+
+def load_lumi_json_payload(path: Path) -> Any:
+    with path.open(encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def lumi_list_from_value(value: Any, *, base_dir: Path | None = None) -> LumiList:
+    if isinstance(value, LumiList):
+        return value
+    if isinstance(value, str):
+        payload = load_lumi_json_payload(
+            normalize_local_lumi_path(value, base_dir=base_dir)
+        )
+        return lumi_list_from_value(payload)
+    if isinstance(value, dict):
+        if _is_compact_list_dict(value):
+            return LumiList(compactList=value)
+        if _is_runs_and_lumis_dict(value):
+            return LumiList(runsAndLumis=value)
+        raise ValueError(f"Unsupported lumi-mask dict shape: {value!r}")
+    if isinstance(value, list):
+        if not _is_run_lumi_pair_list(value):
+            raise ValueError("List lumi masks must be a list of [run, lumi] pairs.")
+        return LumiList(lumis=value)
+    raise ValueError(f"Unsupported lumi mask value: {value!r}")
+
+
+def compact_lumi_dict(
+    value: Any, *, base_dir: Path | None = None
+) -> dict[str, list[list[int]]]:
+    lumi_list = lumi_list_from_value(value, base_dir=base_dir)
+    compact = lumi_list.getCompactList()
+    return {
+        str(run): [[int(pair[0]), int(pair[1])] for pair in ranges]
+        for run, ranges in sorted(compact.items(), key=lambda item: int(item[0]))
     }
-    return json.dumps(normalized, sort_keys=True)
+
+
+def normalize_state_lumi_mask(
+    value: Any, *, base_dir: Path | None = None
+) -> dict[str, list[list[int]]] | None:
+    if value is None:
+        return None
+    return compact_lumi_dict(value, base_dir=base_dir)
+
+
+def exact_same_lumis(
+    left: Any,
+    right: Any,
+    *,
+    left_base: Path | None = None,
+    right_base: Path | None = None,
+) -> bool:
+    left_ll = LumiList(compactList=compact_lumi_dict(left, base_dir=left_base))
+    right_ll = LumiList(compactList=compact_lumi_dict(right, base_dir=right_base))
+    return not (left_ll - right_ll).getCompactList() and not (
+        right_ll - left_ll
+    ).getCompactList()
 
 
 def processed_equals_planned(artifacts: dict[str, Any]) -> bool:
@@ -607,7 +843,7 @@ def processed_equals_planned(artifacts: dict[str, Any]) -> bool:
     planned = Path(str(artifacts.get("task_lumis_to_process") or ""))
     if not processed.is_file() or not planned.is_file():
         return False
-    return canonical_lumi_json(processed) == canonical_lumi_json(planned)
+    return exact_same_lumis(str(processed), str(planned))
 
 
 def finished_job_count(attempt: dict[str, Any]) -> int:
@@ -662,6 +898,9 @@ def artifacts_for_attempt(
         "next_child_task_path": str(
             (crab_data_dir / f"crab_{next_request_name}").resolve()
         ),
+        "next_planned_lumi_mask_file": str(
+            (output_dir / "lumimasks" / f"{next_request_name}.json").resolve()
+        ),
         "next_recover_cfg": str(
             (output_dir / "configs" / f"{next_request_name}.py").resolve()
         ),
@@ -672,16 +911,39 @@ def populate_attempt_metadata(state: dict[str, Any], attempt: dict[str, Any]) ->
     crab_data_dir = Path(str(state["cwd"] or Path.cwd())).resolve()
     cfg_path = resolve_cfg_path(crab_data_dir, str(attempt["cfg"]))
     attempt["cfg_path"] = str(cfg_path)
-    attempt["request_name"] = cfg_path.stem
-    metadata = parse_original_cfg_metadata(cfg_path)
-    attempt["original_lumi_mask"] = metadata["lumi_mask"]
-    attempt["original_units_per_job"] = int(metadata["units_per_job"])
-    attempt["publication_enabled"] = bool(metadata["publication_enabled"])
-    attempt["original_output_dataset_tag"] = metadata["output_dataset_tag"]
+    config_metadata = attempt_config_metadata(attempt)
+    needs_cfg_load = (
+        config_metadata is None
+        or attempt.get("original_lumi_mask") is None
+        or not attempt.get("request_name")
+    )
+    if needs_cfg_load:
+        try:
+            metadata = load_cfg_metadata_via_runpy(cfg_path)
+        except Exception:
+            if config_metadata is None:
+                raise
+            attempt.setdefault("request_name", cfg_path.stem)
+        else:
+            attempt["request_name"] = metadata["request_name"]
+            attempt["original_lumi_mask"] = normalize_state_lumi_mask(
+                metadata["lumi_mask"], base_dir=cfg_path.parent
+            )
+            config_metadata = build_attempt_config_metadata(metadata)
+    else:
+        attempt["request_name"] = str(attempt.get("request_name") or cfg_path.stem)
+
+    if config_metadata is None:
+        raise ValueError(f"Missing effective config metadata for {cfg_path}.")
+
+    attempt["config_metadata"] = config_metadata
+    attempt["original_units_per_job"] = int(config_metadata["units_per_job"])
+    attempt["publication_enabled"] = bool(config_metadata["publication_enabled"])
+    attempt["original_output_dataset_tag"] = config_metadata["output_dataset_tag"]
     if int(attempt.get("generation", 0)) == 0 and not attempt.get(
         "planned_lumi_mask"
     ):
-        attempt["planned_lumi_mask"] = metadata["lumi_mask"]
+        attempt["planned_lumi_mask"] = attempt["original_lumi_mask"]
         attempt["planned_lumi_source"] = "original_task_lumi_mask"
 
 
@@ -745,8 +1007,9 @@ def derive_recovery_for_attempt(
     if recovery.get("derived_from_revision") != attempt.get("status_revision"):
         clear_stale_resolution(recovery)
 
-    family = state["families"][attempt["family_id"]]
-    has_child_attempt = family["latest_attempt_id"] != attempt["task_dir"]
+    has_child_attempt = get_latest_task(state, str(attempt["task_dir"])) != str(
+        attempt["task_dir"]
+    )
 
     recovery.update(
         {
@@ -849,7 +1112,7 @@ def ensure_recovery_current(state: dict[str, Any]) -> None:
 
 def resolve_lumi_for_attempt(
     attempt: dict[str, Any], runtime_server_status: str | None = None
-) -> tuple[str, str, str]:
+) -> tuple[str, str, Any]:
     artifacts = attempt.get("artifacts", {})
     preserved = Path(
         str(artifacts.get("preserved_not_finished_lumis") or "")
@@ -862,12 +1125,14 @@ def resolve_lumi_for_attempt(
     )
 
     if json_file_nonempty(preserved):
-        return "submit", "preserved_not_finished", str(preserved)
+        return "submit", "preserved_not_finished", compact_lumi_dict(str(preserved))
     if preserved.is_file():
         return "skip", "no_not_finished_lumis", ""
 
     if json_file_nonempty(task_not_finished):
-        return "submit", "task_results_not_finished", str(task_not_finished)
+        return "submit", "task_results_not_finished", compact_lumi_dict(
+            str(task_not_finished)
+        )
     if task_not_finished.is_file():
         return "skip", "no_not_finished_lumis", ""
 
@@ -880,41 +1145,51 @@ def resolve_lumi_for_attempt(
         classification == "killed_recovery_candidate"
         or normalized_runtime_status == "KILLED"
     ) and planned_lumi_mask:
-        return "submit", "parent_planned_lumi_mask_killed", str(planned_lumi_mask)
+        return "submit", "parent_planned_lumi_mask_killed", planned_lumi_mask
 
     if has_explicit_zero_finished_jobs(attempt) and planned_lumi_mask:
-        return "submit", "parent_planned_lumi_mask_no_finished_jobs", str(
-            planned_lumi_mask
-        )
+        return "submit", "parent_planned_lumi_mask_no_finished_jobs", planned_lumi_mask
 
     return "error", "missing_not_finished_lumis", ""
 
 
+def write_compact_lumi_mask_file(
+    compact_mask: dict[str, list[list[int]]], output_path: Path
+) -> Path:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(compact_mask, indent=2, sort_keys=True) + "\n")
+    return output_path
+
+
 def render_recovery_config(attempt: dict[str, Any], template_path: Path) -> Path:
     cfg_path = Path(str(attempt["cfg_path"])).resolve()
-    metadata = parse_original_cfg_metadata(cfg_path)
+    config_metadata = attempt_config_metadata(attempt)
+    if config_metadata is None:
+        config_metadata = build_attempt_config_metadata(
+            load_cfg_metadata_via_runpy(cfg_path)
+        )
     recovery = attempt.get("recovery", {})
     artifacts = attempt.get("artifacts", {})
 
-    original_units = int(metadata["units_per_job"])
-    publication_enabled = bool(metadata["publication_enabled"])
+    original_units = int(config_metadata["units_per_job"])
+    publication_enabled = bool(config_metadata["publication_enabled"])
     default_output_dataset_tag = (
-        str(metadata["output_dataset_tag"])
-        if publication_enabled and metadata["output_dataset_tag"] is not None
+        str(config_metadata["output_dataset_tag"])
+        if publication_enabled and config_metadata["output_dataset_tag"] is not None
         else str(artifacts["next_recover_request_name"])
     )
 
-    lumi_mask_path = normalize_lumi_mask_value(
-        str(
-            recovery.get("resolved_lumi_mask")
-            or artifacts["preserved_not_finished_lumis"]
-        )
+    compact_mask = recovery.get("resolved_lumi_mask")
+    if compact_mask is None:
+        compact_mask = compact_lumi_dict(str(artifacts["preserved_not_finished_lumis"]))
+    lumi_mask_path = write_compact_lumi_mask_file(
+        compact_mask, Path(str(artifacts["next_planned_lumi_mask_file"])).resolve()
     )
     replacements = {
         "__ORIGINAL_CONFIG__": repr(str(cfg_path)),
         "__ORIGINAL_REQUEST_NAME__": repr(str(attempt["request_name"])),
         "__REQUEST_NAME__": repr(str(artifacts["next_recover_request_name"])),
-        "__LUMI_MASK__": repr(lumi_mask_path),
+        "__LUMI_MASK__": repr(str(lumi_mask_path)),
         "__UNITS_PER_JOB__": str(original_units),
         "__DEFAULT_OUTPUT_DATASET_TAG__": repr(default_output_dataset_tag),
     }
@@ -981,6 +1256,85 @@ def render_all(args: argparse.Namespace) -> int:
     return 0
 
 
+def load_cfg_lumi_mask(cfg_path: Path) -> Any:
+    return load_cfg_metadata_via_runpy(cfg_path)["lumi_mask"]
+
+
+def load_cfg_request_name(cfg_path: Path) -> str:
+    return str(load_cfg_metadata_via_runpy(cfg_path)["request_name"])
+
+
+def expected_child_lumi_mask(attempt: dict[str, Any]) -> tuple[str, Any | None]:
+    artifacts = attempt.get("artifacts", {})
+    preserved = Path(str(artifacts.get("preserved_not_finished_lumis") or "")).resolve()
+    task_local = Path(str(artifacts.get("task_not_finished_lumis") or "")).resolve()
+
+    if json_file_nonempty(preserved):
+        return "preserved_not_finished", compact_lumi_dict(str(preserved))
+    if json_file_nonempty(task_local):
+        return "task_results_not_finished", compact_lumi_dict(str(task_local))
+    if processed_equals_planned(artifacts):
+        return "complete", None
+    if (
+        str(attempt.get("recovery", {}).get("classification") or "")
+        == "killed_recovery_candidate"
+        or has_explicit_zero_finished_jobs(attempt)
+    ):
+        planned = attempt.get("planned_lumi_mask")
+        if planned:
+            return "parent_planned_lumi_mask_fallback", planned
+    raise RuntimeError("Cannot validate child recovery coverage")
+
+
+def validate_child_coverage_against_parent(
+    attempt: dict[str, Any], child_lumi_mask: Any, *, child_base_dir: Path
+) -> str:
+    source, expected = expected_child_lumi_mask(attempt)
+    if source == "complete":
+        raise RuntimeError("Parent attempt is already complete; no child may be chained.")
+    if not exact_same_lumis(expected, child_lumi_mask, right_base=child_base_dir):
+        raise RuntimeError(
+            f"Child lumi mask does not exactly match parent missing coverage ({source})."
+        )
+    return source
+
+
+def child_append_spec(
+    attempt: dict[str, Any],
+    *,
+    child_task_dir: str,
+    child_cfg_path: Path,
+    child_task_path: Path,
+    child_request_name: str,
+    child_lumi_mask: Any,
+    child_cfg_metadata: dict[str, Any],
+    planned_lumi_source: str | None = None,
+) -> ChainAppendSpec:
+    config_metadata = build_attempt_config_metadata(child_cfg_metadata)
+    return ChainAppendSpec(
+        task_dir=child_task_dir,
+        cfg_path=str(child_cfg_path.resolve()),
+        task_path=str(child_task_path.resolve()),
+        request_name=child_request_name,
+        planned_lumi_mask=compact_lumi_dict(
+            child_lumi_mask, base_dir=child_cfg_path.parent
+        ),
+        planned_lumi_source=str(
+            planned_lumi_source
+            or attempt.get("recovery", {}).get("resolved_lumi_source")
+            or attempt.get("planned_lumi_source")
+            or "manual_chain"
+        ),
+        original_lumi_mask=normalize_state_lumi_mask(
+            child_cfg_metadata.get("lumi_mask"), base_dir=child_cfg_path.parent
+        ),
+        original_units_per_job=int(config_metadata["units_per_job"]),
+        publication_enabled=bool(config_metadata["publication_enabled"]),
+        original_output_dataset_tag=config_metadata["output_dataset_tag"],
+        config_metadata=config_metadata,
+    )
+
+
 def list_executable(args: argparse.Namespace) -> int:
     state_path = resolve_state_file_arg(args).resolve()
     state = load_state(state_path)
@@ -1030,7 +1384,12 @@ def resolve_lumi_mask(args: argparse.Namespace) -> int:
     attempt["recovery"]["resolved_lumi_mask"] = path or None
     state["updated_at"] = now_iso()
     write_json(state_path, state)
-    print("\t".join([action, source, path]))
+    output = ""
+    if isinstance(path, str):
+        output = path
+    elif path:
+        output = json.dumps(path, sort_keys=True)
+    print("\t".join([action, source, output]))
     return 0
 
 
@@ -1052,11 +1411,6 @@ def record_submission(args: argparse.Namespace) -> int:
             f"Task {attempt['task_dir']} has no resolved recovery lumi mask; run resolve-lumi-mask first."
         )
 
-    family = state["families"][attempt["family_id"]]
-    if family["latest_attempt_id"] != attempt["task_dir"]:
-        raise RuntimeError(
-            f"Task {attempt['task_dir']} is not the latest attempt in its family."
-        )
     if recovery.get("submitted_child_attempt_id"):
         raise RuntimeError(
             f"Task {attempt['task_dir']} already recorded child {recovery['submitted_child_attempt_id']}."
@@ -1064,34 +1418,72 @@ def record_submission(args: argparse.Namespace) -> int:
 
     artifacts = attempt["artifacts"]
     child_task_dir = str(artifacts["next_child_task_dir"])
-    child_attempt = {
-        "task_dir": child_task_dir,
-        "cfg": str(artifacts["next_recover_cfg"]),
-        "cfg_path": str(artifacts["next_recover_cfg"]),
-        "task_path": str(artifacts["next_child_task_path"]),
-        "request_name": str(artifacts["next_recover_request_name"]),
-        "family_id": str(attempt["family_id"]),
-        "parent_attempt_id": str(attempt["task_dir"]),
-        "generation": int(attempt.get("generation", 0)) + 1,
-        "planned_lumi_mask": str(recovery["resolved_lumi_mask"]),
-        "planned_lumi_source": str(recovery["resolved_lumi_source"]),
-        "original_lumi_mask": attempt.get("original_lumi_mask"),
-        "original_units_per_job": None,
-        "publication_enabled": False,
-        "original_output_dataset_tag": None,
-        "status_revision": None,
-        "status": {"status_collection_state": STATUS_COLLECTION_NOT_COLLECTED},
-        "recovery": {},
-        "artifacts": {},
-    }
-    state["attempts"][child_task_dir] = child_attempt
+    child_cfg_path = Path(str(artifacts["next_recover_cfg"])).resolve()
+    child_cfg_metadata = load_cfg_metadata_via_runpy(child_cfg_path)
+    child_spec = child_append_spec(
+        attempt,
+        child_task_dir=child_task_dir,
+        child_cfg_path=child_cfg_path,
+        child_task_path=Path(str(artifacts["next_child_task_path"])),
+        child_request_name=str(artifacts["next_recover_request_name"]),
+        child_lumi_mask=recovery["resolved_lumi_mask"],
+        child_cfg_metadata=child_cfg_metadata,
+    )
+    append_after(
+        state,
+        str(attempt["task_dir"]),
+        child_spec,
+        status_collection_state=STATUS_COLLECTION_NOT_COLLECTED,
+    )
     recovery["submitted_child_attempt_id"] = child_task_dir
     recovery["submitted_at"] = now_iso()
-    rebuild_families(state)
     state["updated_at"] = now_iso()
     write_json(state_path, state)
     print(child_task_dir)
     print(state_path)
+    return 0
+
+
+def add_to_chain(args: argparse.Namespace) -> int:
+    state_path = resolve_state_file_arg(args).resolve()
+    state = load_state(state_path)
+    ensure_recovery_current(state)
+    rebuild_families(state)
+
+    attempt = find_attempt(state, args.parent_task)
+    child_cfg_path = Path(args.child_cfg).resolve()
+    child_cfg_metadata = load_cfg_metadata_via_runpy(child_cfg_path)
+    child_lumi_mask = child_cfg_metadata["lumi_mask"]
+    child_request_name = str(child_cfg_metadata["request_name"])
+    source = validate_child_coverage_against_parent(
+        attempt, child_lumi_mask, child_base_dir=child_cfg_path.parent
+    )
+    child_task_path = (
+        Path(args.child_task_path).resolve()
+        if args.child_task_path
+        else (Path(str(state.get("cwd") or Path.cwd())).resolve() / args.child_task_dir)
+    )
+    child_spec = child_append_spec(
+        attempt,
+        child_task_dir=str(args.child_task_dir),
+        child_cfg_path=child_cfg_path,
+        child_task_path=child_task_path,
+        child_request_name=child_request_name,
+        child_lumi_mask=child_lumi_mask,
+        child_cfg_metadata=child_cfg_metadata,
+        planned_lumi_source=source,
+    )
+    append_after(
+        state,
+        str(attempt["task_dir"]),
+        child_spec,
+        status_collection_state=STATUS_COLLECTION_NOT_COLLECTED,
+    )
+    state["updated_at"] = now_iso()
+    write_json(state_path, state)
+    print(child_spec.task_dir)
+    print(state_path)
+    print(source)
     return 0
 
 
@@ -1110,6 +1502,8 @@ def main(argv: list[str] | None = None) -> int:
         return resolve_lumi_mask(args)
     if args.command == "record-submission":
         return record_submission(args)
+    if args.command == "add-to-chain":
+        return add_to_chain(args)
     raise ValueError(f"Unknown command {args.command}")
 
 

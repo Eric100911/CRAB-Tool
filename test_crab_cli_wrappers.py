@@ -19,6 +19,7 @@ PREPARE_RECOVERY_SH = SCRIPT_DIR / "prepare_recovery_tasks.sh"
 KILL_RECOVER_SH = SCRIPT_DIR / "kill_unfinished_and_submit_recover.sh"
 STATUS_SNAPSHOT_PY = SCRIPT_DIR / "crab_status_snapshot.py"
 RECOVERY_BUILDER_PY = SCRIPT_DIR / "crab_recovery_task_builder.py"
+ROOT_COMPACT_MASK = {"1": [[1, 5]]}
 
 
 def install_fake_wmcore(root: Path) -> None:
@@ -138,7 +139,7 @@ def make_recovery_state(
     install_fake_wmcore(tmp)
     cfg_path = tmp / "sample_cfg.py"
     original_lumi_mask = tmp / "original_lumi_mask.json"
-    original_lumi_mask.write_text("{}\n")
+    original_lumi_mask.write_text(json.dumps(ROOT_COMPACT_MASK) + "\n")
     write_original_cfg(cfg_path, original_lumi_mask)
     task_path = tmp / "crab_sample_cfg"
     task_path.mkdir()
@@ -172,9 +173,9 @@ def make_recovery_state(
                         "family_id": "crab_sample_cfg",
                         "parent_attempt_id": None,
                         "generation": 0,
-                        "planned_lumi_mask": str(original_lumi_mask),
+                        "planned_lumi_mask": ROOT_COMPACT_MASK,
                         "planned_lumi_source": "original_task_lumi_mask",
-                        "original_lumi_mask": str(original_lumi_mask),
+                        "original_lumi_mask": ROOT_COMPACT_MASK,
                         "status_revision": "sha256:test",
                         "status": {
                             "status_collection_state": "ok_json",
@@ -210,6 +211,9 @@ def make_recovery_state(
                             "next_recover_request_name": "sample_cfg__recover1",
                             "next_child_task_dir": "crab_sample_cfg__recover1",
                             "next_child_task_path": str(tmp / "crab_sample_cfg__recover1"),
+                            "next_planned_lumi_mask_file": str(
+                                recovery_cache_dir / "lumimasks" / "sample_cfg__recover1.json"
+                            ),
                         },
                     }
                 },
@@ -404,7 +408,7 @@ class CrabCliWrapperTest(unittest.TestCase):
             self.assertIn(f"crab resubmit -d {task_dir} --jobids", completed.stdout)
             self.assertIn("7\\,9", completed.stdout)
 
-    def test_python_help_outputs_do_not_require_cmssw(self) -> None:
+    def test_python_help_keeps_status_available_but_recovery_builder_needs_cmsenv(self) -> None:
         env = self.base_env()
         status_help = self.run_command(
             [sys.executable, str(STATUS_SNAPSHOT_PY), "collect", "--help"], env=env
@@ -416,9 +420,8 @@ class CrabCliWrapperTest(unittest.TestCase):
         recovery_help = self.run_command(
             [sys.executable, str(RECOVERY_BUILDER_PY), "plan", "--help"], env=env
         )
-        self.assertEqual(recovery_help.returncode, 0)
-        self.assertIn("Output files:", recovery_help.stdout)
-        self.assertIn("--stuck-hours", recovery_help.stdout)
+        self.assertNotEqual(recovery_help.returncode, 0)
+        self.assertIn("FWCore.PythonUtilities.LumiList", recovery_help.stderr)
 
     def test_kill_recover_dry_run_reports_before_kill_for_normal_tasks(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -454,7 +457,8 @@ class CrabCliWrapperTest(unittest.TestCase):
                                 "request_name": "sample_cfg",
                                 "family_id": "crab_sample_cfg",
                                 "generation": 0,
-                                "planned_lumi_mask": str(tmp / "original.json"),
+                                "planned_lumi_mask": ROOT_COMPACT_MASK,
+                                "original_lumi_mask": ROOT_COMPACT_MASK,
                                 "status_revision": "sha256:test",
                                 "status": {"status_collection_state": "ok_json", "job_states": {"idle": 1}, "jobs": {}},
                                 "recovery": {
@@ -469,6 +473,9 @@ class CrabCliWrapperTest(unittest.TestCase):
                                         recovery_cache_dir / "reports" / "crab_sample_cfg" / "notFinishedLumis.json"
                                     ),
                                     "next_recover_cfg": str(recovery_cache_dir / "configs" / "sample__recover1.py"),
+                                    "next_planned_lumi_mask_file": str(
+                                        recovery_cache_dir / "lumimasks" / "sample__recover1.json"
+                                    ),
                                 },
                             }
                         },
@@ -545,7 +552,8 @@ class CrabCliWrapperTest(unittest.TestCase):
                                 "request_name": "sample_cfg",
                                 "family_id": "crab_sample_cfg",
                                 "generation": 0,
-                                "planned_lumi_mask": str(tmp / "original.json"),
+                                "planned_lumi_mask": ROOT_COMPACT_MASK,
+                                "original_lumi_mask": ROOT_COMPACT_MASK,
                                 "status_revision": "sha256:test",
                                 "status": {"status_collection_state": "ok_json", "job_states": {"idle": 1}, "jobs": {}},
                                 "recovery": {
@@ -560,6 +568,9 @@ class CrabCliWrapperTest(unittest.TestCase):
                                         recovery_cache_dir / "reports" / "crab_sample_cfg" / "notFinishedLumis.json"
                                     ),
                                     "next_recover_cfg": str(recovery_cache_dir / "configs" / "sample__recover1.py"),
+                                    "next_planned_lumi_mask_file": str(
+                                        recovery_cache_dir / "lumimasks" / "sample__recover1.json"
+                                    ),
                                 },
                             }
                         },
@@ -664,7 +675,7 @@ class CrabCliWrapperTest(unittest.TestCase):
             state = json.loads(state_path.read_text())
             task = state["attempts"]["crab_sample_cfg"]
             self.assertEqual(task["recovery"]["resolved_lumi_source"], "parent_planned_lumi_mask_no_finished_jobs")
-            self.assertEqual(task["recovery"]["resolved_lumi_mask"], str(tmp / "original_lumi_mask.json"))
+            self.assertEqual(task["recovery"]["resolved_lumi_mask"], ROOT_COMPACT_MASK)
 
     def test_kill_recover_execute_skips_report_and_kill_when_runtime_status_is_killed(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -727,6 +738,7 @@ class CrabCliWrapperTest(unittest.TestCase):
             state = json.loads(state_path.read_text())
             task = state["attempts"]["crab_sample_cfg"]
             self.assertEqual(task["recovery"]["resolved_lumi_source"], "parent_planned_lumi_mask_killed")
+            self.assertEqual(task["recovery"]["resolved_lumi_mask"], ROOT_COMPACT_MASK)
 
 
 if __name__ == "__main__":

@@ -13,7 +13,16 @@ export X509_USER_PROXY="$(voms-proxy-info -path)"
 ```
 
 Use `--help` on any wrapper or Python CLI to see the full command reference.
-Help output is always available even if `cmsenv` has not been set yet.
+Shell-wrapper help is available before `cmsenv`, but the Python recovery
+builder now imports `FWCore.PythonUtilities.LumiList` directly and therefore
+should be invoked under `cmsenv`.
+
+The recovery-state Python tests follow the same rule. Run the local suite from
+an active CMSSW runtime:
+
+```bash
+python3 -m unittest discover -s src/HeavyFlavorAnalysis/TPS-Onia2MuMu/test/crabData -p 'test_crab*.py'
+```
 
 ## What drives the configuration
 
@@ -187,6 +196,7 @@ Outputs:
 - `status_cache/latest_state.json`
 - `recovery_cache/generated_recovery_configs.txt`
 - `recovery_cache/configs/*.py`
+- `recovery_cache/lumimasks/*.json`
 
 Recovery overrides:
 
@@ -209,11 +219,24 @@ Recovery overrides:
 - During actual recovery execution, normal tasks preserve
   `results/notFinishedLumis.json` into `recovery_cache/reports/<task>/` before
   the original task is killed. The rendered recovery config then uses that
-  preserved file as its lumi mask.
+  preserved coverage written back out as a generated lumi-mask JSON file.
 - The execution wrapper re-checks the live CRAB server status before deciding
   whether a task should follow the normal `report -> kill` path or the
   already-killed fallback path, even when `--use-cached-status` and
   `--use-prepared-plan` are enabled.
+- Existing recovery tasks created outside the current workflow can be
+  registered manually with:
+
+```bash
+./crab_recovery_task_builder.py add-to-chain \
+  --state-file status_cache/latest_state.json \
+  --parent-task crab_parent \
+  --child-task-dir crab_parent__recover1 \
+  --child-cfg /abs/path/to/crab_parent__recover1.py
+```
+
+- Manual chaining succeeds only when the child config's `config.Data.lumiMask`
+  exactly matches the parent attempt's missing lumi coverage.
 
 ### `kill_unfinished_and_submit_recover.sh`
 
@@ -286,6 +309,7 @@ render recovery configs, or list executable recovery tasks.
 ./crab_recovery_task_builder.py refresh-recovery --help
 ./crab_recovery_task_builder.py render-all --help
 ./crab_recovery_task_builder.py resolve-lumi-mask --help
+./crab_recovery_task_builder.py add-to-chain --help
 ```
 
 `list-executable` prints:
@@ -348,11 +372,15 @@ DRY_RUN=0 ./submit.sh
 - `status_cache/latest_state.json` is the only authoritative cache file.
 - Each original task forms one recovery family.
 - Recovery ancestry is a strict linear chain, not a DAG.
-- Every attempt stores its own `planned_lumi_mask`; recovery-of-recovery falls
-  back to the parent attempt's planned mask rather than widening back to the
-  root task's full lumi mask.
+- Every attempt stores its own `planned_lumi_mask` as canonical compact lumi
+  coverage derived through `FWCore.PythonUtilities.LumiList`.
+- Recovery-of-recovery falls back to the parent attempt's planned compact
+  coverage rather than widening back to the root task's full lumi mask.
 - `recovery_cache/` stores generated artifacts only: rendered configs and
   preserved report files. It is no longer an independent state store.
+- Builder-generated recovery configs receive a generated lumi-mask JSON file
+  under `recovery_cache/lumimasks/`; manually chained tasks keep their original
+  lumi-mask file unchanged.
 
 ## Notes
 
@@ -373,13 +401,17 @@ DRY_RUN=0 ./submit.sh
   original task, preserving `results/notFinishedLumis.json` into
   `recovery_cache/reports/<task>/`, then `crab kill`, and finally `crab submit`
   of a new config that reuses the original task settings with a new request
-  name and the preserved not-finished lumi mask.
+  name and the preserved not-finished lumi coverage.
 - The generated recovery config is now rendered through
   `crab3_recovery_template.py`, which acts as the supported overlay layer for
   recovery-only changes. That template can override the default inherited
   `unitsPerJob`, splitting mode, CRAB job resources, keyed `pyCfgParams`, and
   arbitrary dotted `config.*` assignments without modifying either
   `crab3_template.py` or the original task config.
+- Recovery lumi comparison and manual chain validation use the CMSSW
+  `FWCore.PythonUtilities.LumiList` implementation rather than raw path
+  equality. Equivalent lumi masks written in different compact forms therefore
+  compare correctly.
 - `lumisToProcess.json` is informational and is not used as the recovery lumi
   mask. The normal recovery source is `notFinishedLumis.json`.
 - If a task has explicitly zero finished jobs and `crab report` therefore
@@ -393,3 +425,6 @@ DRY_RUN=0 ./submit.sh
   request names use numbered descendants such as `...__recover1`,
   `...__recover2`, and later recoveries inherit the parent attempt's planned
   lumi mask instead of widening back to the root task scope.
+- Manual registration through `add-to-chain` uses the same append path as
+  automatic `record-submission`, so once a legacy child is registered it will
+  be queried automatically by later `./status.sh` runs.
