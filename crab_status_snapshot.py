@@ -14,6 +14,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from crab_recovery_chain import get_latest_task, rebuild_chain_index
+
 INCOMPATIBLE_STATUS_ARGS = {
     "--jobids",
     "--long",
@@ -47,13 +53,67 @@ def ensure_cmssw_env() -> None:
         )
 
 
+def ensure_proxy_env() -> None:
+    proxy_path = os.environ.get("X509_USER_PROXY")
+    if not proxy_path:
+        raise RuntimeError("export X509_USER_PROXY=$(voms-proxy-info -path) first")
+    if not Path(proxy_path).is_file():
+        raise RuntimeError(f"Missing proxy file {proxy_path}.")
+    completed = subprocess.run(
+        ["voms-proxy-info", "-file", proxy_path, "-all"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        message = completed.stderr.strip() or completed.stdout.strip() or "proxy validation failed"
+        raise RuntimeError(message)
+
+
+def add_manifest_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--manifest",
+        default="generated_crab_configs.txt",
+        help="Manifest that lists one CRAB config path per line.",
+    )
+
+
+def add_cache_locator_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--cache-dir",
+        default="status_cache",
+        help="Directory where the authoritative latest_state.json file is written.",
+    )
+    parser.add_argument(
+        "--state-file",
+        default=None,
+        help="Explicit path for the authoritative state JSON file.",
+    )
+
+
+def add_state_reader_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--state-file",
+        default=f"status_cache/{STATE_NAME}",
+        help="Authoritative state file produced by a status query command.",
+    )
+    parser.add_argument(
+        "--summary-file",
+        default=None,
+        help="Deprecated alias for --state-file.",
+    )
+
+
 def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[str]]:
     parser = argparse.ArgumentParser(
-        description="Collect machine-readable CRAB status snapshots and list failed jobs.",
+        description="Collect, query, display, and summarize CRAB status snapshots.",
         formatter_class=HelpFormatter,
         epilog=(
             "Examples:\n"
             "  crab_status_snapshot.py collect --cache-dir status_cache\n"
+            "  crab_status_snapshot.py query-latest --cache-dir status_cache\n"
+            "  crab_status_snapshot.py query-all --no-update-cache --raw-output -- --verboseErrors\n"
+            "  crab_status_snapshot.py display-cache --state-file status_cache/latest_state.json\n"
             "  crab_status_snapshot.py collect --state-file status_cache/latest_state.json -- --instance prod\n"
             "  crab_status_snapshot.py list-failed --state-file status_cache/latest_state.json\n"
         ),
@@ -76,28 +136,66 @@ def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[
             "--verboseErrors, or --jobids."
         ),
     )
-    collect_parser.add_argument(
-        "--manifest",
-        default="generated_crab_configs.txt",
-        help="Manifest that lists one CRAB config path per line.",
+    add_manifest_arg(collect_parser)
+    add_cache_locator_args(collect_parser)
+
+    query_all_parser = subparsers.add_parser(
+        "query-all",
+        help="Query all tracked tasks, with optional no-cache live mode.",
+        description=(
+            "By default this behaves like 'collect'. Use --no-update-cache to run "
+            "live queries without rewriting latest_state.json."
+        ),
+        formatter_class=HelpFormatter,
     )
-    collect_parser.add_argument(
-        "--cache-dir",
-        default="status_cache",
-        help="Directory where the authoritative latest_state.json file is written.",
+    add_manifest_arg(query_all_parser)
+    add_cache_locator_args(query_all_parser)
+    query_all_parser.add_argument(
+        "--no-update-cache",
+        action="store_true",
+        help="Run live queries without updating latest_state.json.",
     )
-    collect_parser.add_argument(
-        "--state-file",
-        default=None,
-        help="Explicit path for the authoritative state JSON file.",
+    query_all_parser.add_argument(
+        "--raw-output",
+        action="store_true",
+        help="Print raw `crab status` output. Allowed only with --no-update-cache.",
     )
+
+    query_latest_parser = subparsers.add_parser(
+        "query-latest",
+        help="Query only the latest attempt in each recovery chain.",
+        description=(
+            "Refresh latest_state.json using only the end-of-chain attempt for each "
+            "tracked family, plus manifest roots that are not yet tracked."
+        ),
+        formatter_class=HelpFormatter,
+    )
+    add_manifest_arg(query_latest_parser)
+    add_cache_locator_args(query_latest_parser)
+    query_latest_parser.add_argument(
+        "--no-update-cache",
+        action="store_true",
+        help="Run live queries without updating latest_state.json.",
+    )
+    query_latest_parser.add_argument(
+        "--raw-output",
+        action="store_true",
+        help="Print raw `crab status` output. Allowed only with --no-update-cache.",
+    )
+
+    display_cache_parser = subparsers.add_parser(
+        "display-cache",
+        help="Show latest_state.json in a human-friendly chain summary.",
+        formatter_class=HelpFormatter,
+    )
+    add_state_reader_args(display_cache_parser)
 
     list_failed_parser = subparsers.add_parser(
         "list-failed",
-        help="List task directories that have failed jobs in the saved state file.",
+        help="List latest-attempt task directories that have failed jobs in the saved state file.",
         description=(
             "Read a saved latest_state.json file and print one tab-separated line for "
-            "each task that currently contains failed CRAB jobs."
+            "each latest chain attempt that currently contains failed CRAB jobs."
         ),
         formatter_class=HelpFormatter,
         epilog=(
@@ -105,16 +203,7 @@ def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[
             "  task_dir<TAB>comma-separated job ids<TAB>failed job count"
         ),
     )
-    list_failed_parser.add_argument(
-        "--state-file",
-        default=f"status_cache/{STATE_NAME}",
-        help="Authoritative state file produced by the collect subcommand.",
-    )
-    list_failed_parser.add_argument(
-        "--summary-file",
-        default=None,
-        help="Deprecated alias for --state-file.",
-    )
+    add_state_reader_args(list_failed_parser)
 
     return parser.parse_known_args(argv)
 
@@ -128,7 +217,7 @@ def ensure_compatible_status_args(extra_args: list[str]) -> None:
         if command_has_flag(extra_args, flag):
             raise ValueError(
                 f"{flag} is incompatible with machine-readable status collection. "
-                "Use RAW_STATUS=1 ./status.sh for raw CRAB output."
+                "Use query-all/query-latest with --no-update-cache --raw-output for raw CRAB output."
             )
 
 
@@ -186,6 +275,14 @@ def query_task_status(
     task_dir: Path, extra_args: list[str]
 ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
     cmd = ["crab", "status", "-d", str(task_dir), "--json", *extra_args]
+    completed = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    return completed, cmd
+
+
+def query_task_status_raw(
+    task_dir: Path, extra_args: list[str]
+) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+    cmd = ["crab", "status", "-d", str(task_dir), *extra_args]
     completed = subprocess.run(cmd, capture_output=True, text=True, check=False)
     return completed, cmd
 
@@ -345,36 +442,7 @@ def infer_request_lineage(request_name: str, recovery_suffix: str) -> tuple[str,
 
 
 def rebuild_families(state: dict[str, Any]) -> None:
-    grouped: dict[str, list[dict[str, Any]]] = {}
-    for attempt_id, attempt in state["attempts"].items():
-        attempt["task_dir"] = attempt_id
-        family_id = str(attempt.get("family_id") or attempt_id)
-        grouped.setdefault(family_id, []).append(attempt)
-
-    families: dict[str, Any] = {}
-    for family_id, attempts in grouped.items():
-        ordered = sorted(
-            attempts,
-            key=lambda attempt: (
-                int(attempt.get("generation", 0)),
-                str(attempt.get("request_name") or ""),
-                str(attempt.get("task_dir") or ""),
-            ),
-        )
-        root_attempt = next(
-            (attempt for attempt in ordered if int(attempt.get("generation", 0)) == 0),
-            ordered[0],
-        )
-        canonical_family_id = str(root_attempt["task_dir"])
-        for attempt in ordered:
-            attempt["family_id"] = canonical_family_id
-        families[canonical_family_id] = {
-            "root_task_dir": canonical_family_id,
-            "root_cfg": root_attempt.get("cfg"),
-            "attempt_order": [str(attempt["task_dir"]) for attempt in ordered],
-            "latest_attempt_id": str(ordered[-1]["task_dir"]),
-        }
-    state["families"] = families
+    rebuild_chain_index(state)
 
 
 def make_status_payload(
@@ -461,6 +529,37 @@ def load_existing_state(state_path: Path, manifest_path: Path, task_root: Path) 
     return empty_state(manifest_path, task_root)
 
 
+def ensure_family_index_exists(state: dict[str, Any]) -> None:
+    if state.get("attempts") and not state.get("families"):
+        rebuild_families(state)
+
+
+def latest_attempt_ids(state: dict[str, Any]) -> list[str]:
+    if not state.get("attempts"):
+        return []
+
+    ensure_family_index_exists(state)
+    families = state.get("families", {})
+    if not families:
+        return sorted(state["attempts"])
+
+    latest_ids: list[str] = []
+    seen: set[str] = set()
+    for family_id in sorted(families):
+        family = families[family_id]
+        root_task_dir = str(family.get("root_task_dir") or family_id)
+        latest_id = str(family.get("latest_attempt_id") or get_latest_task(state, root_task_dir))
+        if latest_id in state["attempts"] and latest_id not in seen:
+            latest_ids.append(latest_id)
+            seen.add(latest_id)
+    return latest_ids
+
+
+def latest_query_failures(state: dict[str, Any]) -> list[str]:
+    latest_ids = set(latest_attempt_ids(state))
+    return sorted(task_dir for task_dir in state.get("query_failures", []) if task_dir in latest_ids)
+
+
 def query_entries(
     manifest_entries: list[str], task_root: Path, state: dict[str, Any]
 ) -> list[tuple[str, Path]]:
@@ -477,6 +576,51 @@ def query_entries(
     return list(entries.values())
 
 
+def query_latest_entries(
+    manifest_entries: list[str], task_root: Path, state: dict[str, Any]
+) -> list[tuple[str, Path]]:
+    entries: dict[str, tuple[str, Path]] = {}
+    for task_dir_name in latest_attempt_ids(state):
+        attempt = state["attempts"][task_dir_name]
+        cfg = str(attempt.get("cfg_path") or attempt.get("cfg") or "")
+        if not cfg:
+            continue
+        task_path = Path(str(attempt.get("task_path") or (task_root / task_dir_name)))
+        entries[task_path.name] = (cfg, task_path)
+
+    for cfg in manifest_entries:
+        task_dir = task_dir_from_cfg(task_root, cfg)
+        if task_dir.name not in state.get("attempts", {}):
+            entries[task_dir.name] = (cfg, task_dir)
+
+    return [entries[name] for name in sorted(entries)]
+
+
+def run_raw_queries(entries: list[tuple[str, Path]], extra_args: list[str]) -> int:
+    exit_code = 0
+    for _cfg, task_dir in entries:
+        completed, _cmd = query_task_status_raw(task_dir, extra_args)
+        if completed.stdout:
+            sys.stdout.write(completed.stdout)
+        if completed.stderr:
+            sys.stderr.write(completed.stderr)
+        if completed.returncode != 0:
+            exit_code = 1
+    return exit_code
+
+
+def record_query_metadata(
+    state: dict[str, Any],
+    *,
+    query_failures: list[str],
+    header_only_killed_tasks: list[str],
+) -> None:
+    state["query_failures"] = sorted(query_failures)
+    state["header_only_killed_tasks"] = sorted(header_only_killed_tasks)
+    state["task_count"] = len(state["attempts"])
+    state["updated_at"] = now_iso()
+
+
 def run_collect(args: argparse.Namespace, extra_args: list[str]) -> int:
     ensure_compatible_status_args(extra_args)
 
@@ -490,11 +634,14 @@ def run_collect(args: argparse.Namespace, extra_args: list[str]) -> int:
 
     query_failures: list[str] = []
     header_only_killed_tasks: list[str] = []
+    family_structure_changed = bool(state.get("attempts")) and not state.get("families")
 
     for cfg, task_dir in query_entries(read_manifest(manifest_path), task_root, state):
         summary, payload, _stdout, _stderr, _cmd = build_task_summary(cfg, task_dir, extra_args)
         status = make_status_payload(summary, payload)
         task_dir_name = task_dir.name
+        if task_dir_name not in state["attempts"]:
+            family_structure_changed = True
         state["attempts"][task_dir_name] = merge_attempt_status(
             state["attempts"].get(task_dir_name),
             cfg,
@@ -508,13 +655,189 @@ def run_collect(args: argparse.Namespace, extra_args: list[str]) -> int:
             query_failures.append(task_dir_name)
         print(format_task_summary(summary))
 
-    rebuild_families(state)
-    state["query_failures"] = sorted(query_failures)
-    state["header_only_killed_tasks"] = sorted(header_only_killed_tasks)
-    state["task_count"] = len(state["attempts"])
-    state["updated_at"] = now_iso()
+    if family_structure_changed:
+        rebuild_families(state)
+    record_query_metadata(
+        state,
+        query_failures=query_failures,
+        header_only_killed_tasks=header_only_killed_tasks,
+    )
     write_json(state_path, state)
     return 1 if query_failures else 0
+
+
+def run_query_all(args: argparse.Namespace, extra_args: list[str]) -> int:
+    if not args.no_update_cache:
+        if args.raw_output:
+            raise ValueError("--raw-output requires --no-update-cache.")
+        return run_collect(args, extra_args)
+
+    manifest_path = Path(args.manifest).resolve()
+    state_path = resolve_state_file(args).resolve()
+    task_root = Path.cwd().resolve()
+    state = load_existing_state(state_path, manifest_path, task_root)
+    entries = query_entries(read_manifest(manifest_path), task_root, state)
+
+    if args.raw_output:
+        return run_raw_queries(entries, extra_args)
+
+    ensure_compatible_status_args(extra_args)
+    query_failures: list[str] = []
+    for cfg, task_dir in entries:
+        summary, _payload, _stdout, _stderr, _cmd = build_task_summary(cfg, task_dir, extra_args)
+        if summary["status_collection_state"] == STATUS_COLLECTION_FATAL_ERROR:
+            query_failures.append(task_dir.name)
+        print(format_task_summary(summary))
+    return 1 if query_failures else 0
+
+
+def run_query_latest(args: argparse.Namespace, extra_args: list[str]) -> int:
+    if args.raw_output and not args.no_update_cache:
+        raise ValueError("--raw-output requires --no-update-cache.")
+
+    manifest_path = Path(args.manifest).resolve()
+    state_path = resolve_state_file(args).resolve()
+    task_root = Path.cwd().resolve()
+    state = load_existing_state(state_path, manifest_path, task_root)
+    ensure_family_index_exists(state)
+    entries = query_latest_entries(read_manifest(manifest_path), task_root, state)
+
+    if args.no_update_cache and args.raw_output:
+        return run_raw_queries(entries, extra_args)
+
+    ensure_compatible_status_args(extra_args)
+    query_failures: list[str] = []
+    header_only_killed_tasks: list[str] = []
+    family_structure_changed = False
+
+    for cfg, task_dir in entries:
+        summary, payload, _stdout, _stderr, _cmd = build_task_summary(cfg, task_dir, extra_args)
+        task_dir_name = task_dir.name
+        if summary["status_collection_state"] == STATUS_COLLECTION_HEADER_ONLY_KILLED:
+            header_only_killed_tasks.append(task_dir_name)
+        if summary["status_collection_state"] == STATUS_COLLECTION_FATAL_ERROR:
+            query_failures.append(task_dir_name)
+        print(format_task_summary(summary))
+
+        if args.no_update_cache:
+            continue
+
+        if task_dir_name not in state["attempts"]:
+            family_structure_changed = True
+        status = make_status_payload(summary, payload)
+        state["attempts"][task_dir_name] = merge_attempt_status(
+            state["attempts"].get(task_dir_name),
+            cfg,
+            task_dir,
+            status,
+        )
+
+    if args.no_update_cache:
+        return 1 if query_failures else 0
+
+    state["manifest"] = str(manifest_path)
+    state["cwd"] = str(task_root)
+    state["status_args"] = list(extra_args)
+    if family_structure_changed:
+        rebuild_families(state)
+    record_query_metadata(
+        state,
+        query_failures=query_failures,
+        header_only_killed_tasks=header_only_killed_tasks,
+    )
+    write_json(state_path, state)
+    return 1 if query_failures else 0
+
+
+def format_job_states(job_states: dict[str, int]) -> str:
+    if not job_states:
+        return "none"
+    return " ".join(f"{state}={count}" for state, count in sorted(job_states.items()))
+
+
+def format_cache_display(state: dict[str, Any], state_path: Path) -> str:
+    ensure_family_index_exists(state)
+    lines = [
+        f"Cache file: {state_path}",
+        f"Updated at: {state.get('updated_at', 'unknown')}",
+        f"Manifest: {state.get('manifest', '')}",
+        f"Families: {len(state.get('families', {}))}",
+        f"Attempts: {len(state.get('attempts', {}))}",
+        "Query failures: "
+        + (", ".join(latest_query_failures(state)) or "none"),
+        "Header-only killed: "
+        + (", ".join(state.get("header_only_killed_tasks", [])) or "none"),
+    ]
+
+    families = state.get("families", {})
+    if not families:
+        return "\n".join(lines)
+
+    for family_id in sorted(families):
+        family = families[family_id]
+        attempt_order = list(family.get("attempt_order", []))
+        latest_id = str(family.get("latest_attempt_id") or "")
+        lines.extend(
+            [
+                "",
+                f"Family {family_id}",
+                f"  root={family.get('root_task_dir', '')}",
+                f"  latest={latest_id}",
+                f"  chain={' -> '.join(attempt_order) if attempt_order else '(empty)'}",
+            ]
+        )
+        for attempt_id in attempt_order:
+            attempt = state["attempts"].get(attempt_id, {})
+            status = attempt.get("status", {})
+            marker = " latest" if attempt_id == latest_id else ""
+            warning = status.get("query_warning")
+            error = status.get("query_error")
+            message = f" warning={warning}" if warning else ""
+            if error:
+                message = f" error={error}"
+            lines.append(
+                "  - "
+                f"{attempt_id}{marker} "
+                f"server={status.get('server_status') or 'unknown'} "
+                f"scheduler={status.get('scheduler_status') or 'unknown'} "
+                f"collection={status.get('status_collection_state') or STATUS_COLLECTION_NOT_COLLECTED} "
+                f"failed={status.get('failed_job_count', 0)} "
+                f"states={format_job_states(status.get('job_states', {}))}"
+                f"{message}"
+            )
+    return "\n".join(lines)
+
+
+def run_display_cache(args: argparse.Namespace) -> int:
+    state_path = resolve_state_file(args).resolve()
+    if not state_path.exists():
+        raise FileNotFoundError(
+            f"Missing state file {state_path}. Run ./status.sh first."
+        )
+
+    state = ensure_state_shape(load_json(state_path))
+    print(format_cache_display(state, state_path))
+    return 0
+
+
+def iter_latest_failed_entries(
+    state: dict[str, Any],
+) -> list[tuple[str, list[str], int]]:
+    entries: list[tuple[str, list[str], int]] = []
+    for task_dir_name in latest_attempt_ids(state):
+        attempt = state["attempts"][task_dir_name]
+        status = attempt.get("status", {})
+        failed_job_ids = [str(job_id) for job_id in status.get("failed_job_ids", [])]
+        if not failed_job_ids:
+            continue
+        entries.append(
+            (
+                str(attempt["task_dir"]),
+                failed_job_ids,
+                int(status.get("failed_job_count", len(failed_job_ids))),
+            )
+        )
+    return entries
 
 
 def run_list_failed(args: argparse.Namespace) -> int:
@@ -525,7 +848,7 @@ def run_list_failed(args: argparse.Namespace) -> int:
         )
 
     state = ensure_state_shape(load_json(state_path))
-    query_failures = state.get("query_failures", [])
+    query_failures = latest_query_failures(state)
     if query_failures:
         print(
             "Status snapshot contains query failures; refresh status before resubmitting: "
@@ -534,17 +857,13 @@ def run_list_failed(args: argparse.Namespace) -> int:
         )
         return 1
 
-    for attempt in state.get("attempts", {}).values():
-        status = attempt.get("status", {})
-        failed_job_ids = status.get("failed_job_ids", [])
-        if not failed_job_ids:
-            continue
+    for task_dir, failed_job_ids, failed_count in iter_latest_failed_entries(state):
         print(
             "\t".join(
                 [
-                    str(attempt["task_dir"]),
-                    ",".join(str(job_id) for job_id in failed_job_ids),
-                    str(status.get("failed_job_count", len(failed_job_ids))),
+                    task_dir,
+                    ",".join(failed_job_ids),
+                    str(failed_count),
                 ]
             )
         )
@@ -553,11 +872,24 @@ def run_list_failed(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args, extra_args = parse_args(argv)
-    ensure_cmssw_env()
     if args.command == "collect":
+        ensure_cmssw_env()
+        ensure_proxy_env()
         return run_collect(args, extra_args)
+    if args.command == "query-all":
+        ensure_cmssw_env()
+        ensure_proxy_env()
+        return run_query_all(args, extra_args)
+    if args.command == "query-latest":
+        ensure_cmssw_env()
+        ensure_proxy_env()
+        return run_query_latest(args, extra_args)
     if extra_args:
-        raise ValueError(f"Unexpected extra arguments for list-failed: {' '.join(extra_args)}")
+        raise ValueError(
+            f"Unexpected extra arguments for {args.command}: {' '.join(extra_args)}"
+        )
+    if args.command == "display-cache":
+        return run_display_cache(args)
     return run_list_failed(args)
 
 

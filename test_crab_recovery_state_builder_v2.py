@@ -5,12 +5,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
-import re
-import runpy
 import sys
 import tempfile
 import unittest
-from contextlib import contextmanager
 from pathlib import Path
 
 MODULE_PATH = Path(__file__).with_name("crab_recovery_state_builder.py")
@@ -21,6 +18,8 @@ builder = importlib.util.module_from_spec(MODULE_SPEC)
 assert MODULE_SPEC.loader is not None
 sys.path.insert(0, str(MODULE_PATH.parent))
 MODULE_SPEC.loader.exec_module(builder)
+
+from crab_config_literals import load_cfg_metadata_via_literals, parse_literal_crab_config_file
 
 TEMPLATE_PATH = Path(__file__).with_name("crab3_recovery_template.py")
 ROOT_COMPACT_MASK = {"1": [[1, 5]]}
@@ -65,60 +64,16 @@ def write_original_cfg(
         "config.Site.storageSite = 'T2_TEST_SITE'\n"
     )
 
-
-def install_fake_wmcore(tmp: Path) -> None:
-    wmcore_dir = tmp / "WMCore"
-    wmcore_dir.mkdir()
-    (wmcore_dir / "__init__.py").write_text("")
-    (wmcore_dir / "Configuration.py").write_text(
-        "from types import SimpleNamespace\n"
-        "\n"
-        "class Configuration:\n"
-        "    def section_(self, name):\n"
-        "        section = SimpleNamespace()\n"
-        "        setattr(self, name, section)\n"
-        "        return section\n"
-    )
-
-
-@contextmanager
-def prepend_sys_path(path: Path):
-    sys.path.insert(0, str(path))
-    try:
-        yield
-    finally:
-        sys.path = [entry for entry in sys.path if entry != str(path)]
-
-
 def render_template_with_attempt(
     tmp: Path, attempt: dict[str, object], template_text: str
-) -> object:
-    install_fake_wmcore(tmp)
+) -> tuple[object, dict[str, object]]:
     template_copy = tmp / "crab3_recovery_template.py"
     template_copy.write_text(template_text)
     rendered_path = builder.render_recovery_config(attempt, template_copy)
-    with prepend_sys_path(tmp):
-        namespace = runpy.run_path(str(rendered_path))
-    return namespace["config"]
-
-
-def reset_template_overrides(template_text: str) -> str:
-    normalized = template_text
-    replacements = [
-        (r"^RECOVERY_UNITS_PER_JOB = .*$", "RECOVERY_UNITS_PER_JOB = None"),
-        (r"^RECOVERY_SPLITTING = .*$", "RECOVERY_SPLITTING = None"),
-        (r"^RECOVERY_NUM_CORES = .*$", "RECOVERY_NUM_CORES = None"),
-        (r"^RECOVERY_MAX_MEMORY_MB = .*$", "RECOVERY_MAX_MEMORY_MB = None"),
-    ]
-    for pattern, replacement in replacements:
-        normalized = re.sub(pattern, replacement, normalized, flags=re.MULTILINE)
-    normalized = re.sub(
-        r"RECOVERY_PYCFG_PARAM_OVERRIDES = \{\n(?:.*\n)*?\}",
-        'RECOVERY_PYCFG_PARAM_OVERRIDES = {\n    "numThreads": 1,\n    "numStreams": 0,\n}',
-        normalized,
-        flags=re.MULTILINE,
+    return (
+        parse_literal_crab_config_file(rendered_path),
+        load_cfg_metadata_via_literals(rendered_path),
     )
-    return normalized
 
 
 class CrabRecoveryStateBuilderTest(unittest.TestCase):
@@ -184,8 +139,7 @@ class CrabRecoveryStateBuilderTest(unittest.TestCase):
                     "recovery_suffix": "recover",
                 },
             )
-            with prepend_sys_path(tmp):
-                self.assertEqual(builder.refresh_recovery_state(args), 0)
+            self.assertEqual(builder.refresh_recovery_state(args), 0)
             state = json.loads(state_path.read_text())
             attempt = state["attempts"]["crab_sample_cfg"]
             self.assertEqual(attempt["planned_lumi_mask"], ROOT_COMPACT_MASK)
@@ -206,7 +160,6 @@ class CrabRecoveryStateBuilderTest(unittest.TestCase):
     def test_record_submission_appends_linear_family_child(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
-            install_fake_wmcore(tmp)
             parent_cfg = tmp / "parent.py"
             original_lumi_mask = tmp / "original_lumi_mask.json"
             original_lumi_mask.write_text(json.dumps(ROOT_COMPACT_MASK) + "\n")
@@ -274,11 +227,10 @@ class CrabRecoveryStateBuilderTest(unittest.TestCase):
                 )
             )
             state = json.loads(state_path.read_text())
-            with prepend_sys_path(tmp):
-                builder.render_recovery_config(
-                    state["attempts"]["crab_parent"],
-                    TEMPLATE_PATH,
-                )
+            builder.render_recovery_config(
+                state["attempts"]["crab_parent"],
+                TEMPLATE_PATH,
+            )
             args = type(
                 "Args",
                 (),
@@ -289,8 +241,7 @@ class CrabRecoveryStateBuilderTest(unittest.TestCase):
                     "task": "crab_parent",
                 },
             )
-            with prepend_sys_path(tmp):
-                self.assertEqual(builder.record_submission(args), 0)
+            self.assertEqual(builder.record_submission(args), 0)
             state = json.loads(state_path.read_text())
             self.assertEqual(
                 state["families"]["crab_parent"]["attempt_order"],
@@ -335,20 +286,27 @@ class CrabRecoveryStateBuilderTest(unittest.TestCase):
                 },
             }
 
-            config = render_template_with_attempt(
-                tmp, attempt, reset_template_overrides(TEMPLATE_PATH.read_text())
+            parsed, metadata = render_template_with_attempt(
+                tmp, attempt, TEMPLATE_PATH.read_text()
             )
-            self.assertEqual(config.General.requestName, "parent__recover1")
+            self.assertEqual(parsed.get_field("General", "requestName"), "parent__recover1")
             expected_lumi_mask_path = (
                 tmp / "recovery_cache" / "lumimasks" / "parent__recover1.json"
             )
-            self.assertEqual(config.Data.lumiMask, str(expected_lumi_mask_path))
+            self.assertEqual(
+                parsed.get_field("Data", "lumiMask"), str(expected_lumi_mask_path)
+            )
             self.assertEqual(
                 json.loads(expected_lumi_mask_path.read_text()), ROOT_COMPACT_MASK
             )
-            self.assertEqual(config.Data.unitsPerJob, 40)
+            self.assertEqual(parsed.get_field("Data", "unitsPerJob"), 100)
+            self.assertEqual(parsed.get_field("Data", "splitting"), "LumiBased")
+            self.assertEqual(parsed.get_field("Data", "outputDatasetTag"), "parent__recover1")
+            self.assertEqual(parsed.get_field("Data", "publication"), False)
+            self.assertEqual(parsed.get_field("JobType", "numCores"), 1)
+            self.assertEqual(parsed.get_field("JobType", "maxMemoryMB"), 2000)
             self.assertEqual(
-                config.JobType.pyCfgParams,
+                parsed.get_field("JobType", "pyCfgParams"),
                 [
                     "runOnMC=False",
                     "era=Run2024H",
@@ -357,6 +315,18 @@ class CrabRecoveryStateBuilderTest(unittest.TestCase):
                     "numThreads=1",
                     "numStreams=0",
                 ],
+            )
+            self.assertEqual(parsed.get_field("Site", "storageSite"), "T2_TEST_SITE")
+            self.assertEqual(
+                metadata,
+                {
+                    "request_name": "parent__recover1",
+                    "units_per_job": 100,
+                    "publication_enabled": False,
+                    "output_dataset_tag": "parent__recover1",
+                    "lumi_mask": str(expected_lumi_mask_path),
+                    "parsed_config": parsed,
+                },
             )
 
     def test_resolve_lumi_prefers_preserved_not_finished(self) -> None:
@@ -436,7 +406,6 @@ class CrabRecoveryStateBuilderTest(unittest.TestCase):
             child_cfg_path = tmp / "parent__recover1.py"
             child_lumi_mask = tmp / "child_lumi_mask.json"
             child_lumi_mask.write_text(json.dumps(ROOT_COMPACT_MASK) + "\n")
-            install_fake_wmcore(tmp)
             write_original_cfg(child_cfg_path, lumi_mask=str(child_lumi_mask))
 
             state_path.write_text(
@@ -490,8 +459,7 @@ class CrabRecoveryStateBuilderTest(unittest.TestCase):
                     "child_task_path": str(child_task_path),
                 },
             )
-            with prepend_sys_path(tmp):
-                self.assertEqual(builder.add_to_chain(args), 0)
+            self.assertEqual(builder.add_to_chain(args), 0)
             state = json.loads(state_path.read_text())
             self.assertEqual(
                 state["families"]["crab_parent"]["attempt_order"],
@@ -515,7 +483,6 @@ class CrabRecoveryStateBuilderTest(unittest.TestCase):
     def test_refresh_recovery_uses_persisted_child_config_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
-            install_fake_wmcore(tmp)
             parent_cfg = tmp / "parent.py"
             child_cfg = tmp / "parent__recover1.py"
             original_lumi_mask = tmp / "original_lumi_mask.json"
@@ -527,8 +494,7 @@ class CrabRecoveryStateBuilderTest(unittest.TestCase):
                 child_cfg,
                 lumi_mask=str(child_lumi_mask),
                 units_per_job=10,
-                output_dataset_tag_expr="DEFAULT_OUTPUT_DATASET_TAG",
-                preamble="DEFAULT_OUTPUT_DATASET_TAG = 'parent__recover1'\n",
+                output_dataset_tag_expr="'parent__recover1'",
             )
 
             state_path = tmp / builder.STATE_NAME
@@ -602,8 +568,7 @@ class CrabRecoveryStateBuilderTest(unittest.TestCase):
                     "child_task_path": str(tmp / "crab_parent__recover1"),
                 },
             )
-            with prepend_sys_path(tmp):
-                self.assertEqual(builder.add_to_chain(add_args), 0)
+            self.assertEqual(builder.add_to_chain(add_args), 0)
 
             refresh_args = type(
                 "Args",
@@ -617,8 +582,7 @@ class CrabRecoveryStateBuilderTest(unittest.TestCase):
                     "recovery_suffix": "recover",
                 },
             )
-            with prepend_sys_path(tmp):
-                self.assertEqual(builder.refresh_recovery_state(refresh_args), 0)
+            self.assertEqual(builder.refresh_recovery_state(refresh_args), 0)
 
             state = json.loads(state_path.read_text())
             child = state["attempts"]["crab_parent__recover1"]
@@ -631,7 +595,7 @@ class CrabRecoveryStateBuilderTest(unittest.TestCase):
                 },
             )
 
-    def test_render_recovery_config_inherits_child_effective_units(self) -> None:
+    def test_render_recovery_config_allows_direct_template_overrides(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             cfg_path = tmp / "parent__recover1.py"
@@ -641,8 +605,7 @@ class CrabRecoveryStateBuilderTest(unittest.TestCase):
                 cfg_path,
                 lumi_mask=str(child_lumi_mask),
                 units_per_job=10,
-                output_dataset_tag_expr="DEFAULT_OUTPUT_DATASET_TAG",
-                preamble="DEFAULT_OUTPUT_DATASET_TAG = 'parent__recover1'\n",
+                output_dataset_tag_expr="'parent__recover1'",
             )
 
             attempt = {
@@ -664,10 +627,68 @@ class CrabRecoveryStateBuilderTest(unittest.TestCase):
                 },
             }
 
-            config = render_template_with_attempt(
-                tmp, attempt, reset_template_overrides(TEMPLATE_PATH.read_text())
+            template_text = (
+                TEMPLATE_PATH.read_text()
+                .replace(
+                    "config.JobType.pyCfgParams = __DEFAULT_RECOVERY_PYCFG_PARAMS__",
+                    "config.JobType.pyCfgParams = [\n"
+                    "    'runOnMC=False',\n"
+                    "    'era=Run2024H',\n"
+                    "    'outputFile=mymultilep_Run2024Hv1.root',\n"
+                    "    'analysisMode=JpsiJpsiPhi',\n"
+                    "    'numThreads=8',\n"
+                    "    'numStreams=0',\n"
+                    "    'wantSummary=True',\n"
+                    "]",
+                )
+                .replace(
+                    "config.JobType.numCores = __DEFAULT_RECOVERY_NUM_CORES__",
+                    "config.JobType.numCores = 8",
+                )
+                .replace(
+                    "config.JobType.maxMemoryMB = __DEFAULT_RECOVERY_MAX_MEMORY_MB__",
+                    "config.JobType.maxMemoryMB = 8000",
+                )
+                .replace(
+                    "config.Data.unitsPerJob = __DEFAULT_RECOVERY_UNITS_PER_JOB__",
+                    "config.Data.unitsPerJob = 10",
+                )
+                .replace(
+                    "config.Data.splitting = __DEFAULT_RECOVERY_SPLITTING__",
+                    "config.Data.splitting = 'EventAwareLumiBased'",
+                )
+                .replace(
+                    "config.Data.publication = __DEFAULT_RECOVERY_PUBLICATION__",
+                    "config.Data.publication = True",
+                )
+                .replace(
+                    "config.Site.storageSite = __DEFAULT_RECOVERY_STORAGE_SITE__",
+                    "config.Site.storageSite = 'T2_CH_CERN'",
+                )
             )
-            self.assertEqual(config.Data.unitsPerJob, 10)
+
+            parsed, metadata = render_template_with_attempt(tmp, attempt, template_text)
+            self.assertEqual(parsed.get_field("Data", "unitsPerJob"), 10)
+            self.assertEqual(parsed.get_field("Data", "splitting"), "EventAwareLumiBased")
+            self.assertEqual(parsed.get_field("Data", "publication"), True)
+            self.assertEqual(parsed.get_field("JobType", "numCores"), 8)
+            self.assertEqual(parsed.get_field("JobType", "maxMemoryMB"), 8000)
+            self.assertEqual(
+                parsed.get_field("JobType", "pyCfgParams"),
+                [
+                    "runOnMC=False",
+                    "era=Run2024H",
+                    "outputFile=mymultilep_Run2024Hv1.root",
+                    "analysisMode=JpsiJpsiPhi",
+                    "numThreads=8",
+                    "numStreams=0",
+                    "wantSummary=True",
+                ],
+            )
+            self.assertEqual(parsed.get_field("Site", "storageSite"), "T2_CH_CERN")
+            self.assertEqual(metadata["units_per_job"], 10)
+            self.assertTrue(metadata["publication_enabled"])
+            self.assertEqual(metadata["output_dataset_tag"], "parent__recover2")
 
 
 if __name__ == "__main__":

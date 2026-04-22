@@ -9,6 +9,8 @@ import os
 import re
 from pathlib import Path
 
+from crab_config_literals import render_template
+
 MANIFEST_NAME = "generated_crab_configs.txt"
 
 LUMI_MASK_BY_YEAR = {
@@ -143,13 +145,6 @@ def dataset_to_meta(dataset: str) -> dict[str, str]:
         "stream_idx": stream_idx,
         "task_token": task_token,
     }
-
-
-def render_template(template: str, replacements: dict[str, str]) -> str:
-    rendered = template
-    for key, value in replacements.items():
-        rendered = rendered.replace(key, str(value))
-    return rendered
 
 
 def pick_lists(explicit_lists: list[str]) -> list[Path]:

@@ -7,14 +7,21 @@ import argparse
 import json
 import os
 import re
-import runpy
 import sys
-from contextlib import contextmanager
 from datetime import datetime, timezone
 from FWCore.PythonUtilities.LumiList import LumiList
 from pathlib import Path
 from typing import Any
 
+from crab_config_literals import (
+    ParsedCrabConfig,
+    emit_wmcore_crab_config,
+    load_cfg_metadata_via_literals,
+    merge_literal_assignments,
+    parse_literal_crab_config,
+    parse_literal_crab_config_file,
+    render_template,
+)
 from crab_recovery_chain import (
     ChainAppendSpec,
     append_after,
@@ -43,6 +50,13 @@ STATUS_COLLECTION_HEADER_ONLY_KILLED = "header_only_killed"
 STATUS_COLLECTION_FATAL_ERROR = "fatal_error"
 STATUS_COLLECTION_NOT_COLLECTED = "not_collected"
 RECOVERY_RENDER_CLASSES = {"recovery_candidate", "mixed", "killed_recovery_candidate"}
+DEFAULT_RECOVERY_UNITS_PER_JOB = 100
+DEFAULT_RECOVERY_NUM_CORES = 1
+DEFAULT_RECOVERY_MAX_MEMORY_MB = 2000
+DEFAULT_RECOVERY_PYCFG_PARAM_OVERRIDES = {
+    "numThreads": 1,
+    "numStreams": 0,
+}
 
 
 class HelpFormatter(
@@ -630,16 +644,6 @@ def count_states(jobs: dict[str, dict[str, Any]], job_ids: set[str]) -> dict[str
     return dict(sorted(counts.items()))
 
 
-@contextmanager
-def prepend_sys_path(path: Path):
-    resolved = str(path.resolve())
-    sys.path.insert(0, resolved)
-    try:
-        yield
-    finally:
-        sys.path = [entry for entry in sys.path if entry != resolved]
-
-
 def normalize_attempt_config_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
     units_per_job = metadata.get("units_per_job")
     if units_per_job is None:
@@ -654,35 +658,89 @@ def normalize_attempt_config_metadata(metadata: dict[str, Any]) -> dict[str, Any
     }
 
 
-def load_cfg_namespace(cfg_path: Path) -> dict[str, Any]:
-    with prepend_sys_path(cfg_path.parent):
-        return runpy.run_path(str(cfg_path))
+def load_cfg_metadata(cfg_path: Path) -> dict[str, Any]:
+    metadata = load_cfg_metadata_via_literals(cfg_path)
+    metadata.pop("parsed_config", None)
+    return metadata
 
 
-def load_cfg_metadata_via_runpy(cfg_path: Path) -> dict[str, Any]:
-    namespace = load_cfg_namespace(cfg_path)
-    config = namespace.get("config")
-    if config is None:
-        raise ValueError(f"Config object was not created in {cfg_path}.")
+def merge_pycfg_params(
+    base_params: list[Any], overrides: dict[str, Any]
+) -> list[str]:
+    override_map = {str(key): str(value) for key, value in overrides.items()}
+    remaining = dict(override_map)
+    merged: list[str] = []
 
-    general = getattr(config, "General", None)
-    data = getattr(config, "Data", None)
-    if general is None or data is None:
-        raise ValueError(f"Config in {cfg_path} is missing General or Data sections.")
+    for item in base_params:
+        item_text = str(item)
+        if "=" in item_text:
+            key, _value = item_text.split("=", 1)
+            if key in override_map:
+                merged.append(f"{key}={override_map[key]}")
+                remaining.pop(key, None)
+            else:
+                merged.append(item_text)
+        else:
+            merged.append(item_text)
 
-    request_name = getattr(general, "requestName", None)
-    units_per_job = getattr(data, "unitsPerJob", None)
-    if request_name is None:
-        raise ValueError(f"Config in {cfg_path} is missing General.requestName.")
-    if units_per_job is None:
-        raise ValueError(f"Config in {cfg_path} is missing Data.unitsPerJob.")
+    for key, value in override_map.items():
+        if key in remaining:
+            merged.append(f"{key}={value}")
 
+    return merged
+
+
+def original_literal_config(cfg_path: Path) -> ParsedCrabConfig:
+    return parse_literal_crab_config_file(cfg_path)
+
+
+def cfg_field(
+    parsed_config: ParsedCrabConfig,
+    section: str,
+    field_name: str,
+    *,
+    default: Any,
+) -> Any:
+    try:
+        return parsed_config.get_field(section, field_name)
+    except KeyError:
+        return default
+
+
+def build_recovery_replacements(
+    attempt: dict[str, Any],
+    parsed_config: ParsedCrabConfig,
+    config_metadata: dict[str, Any],
+    lumi_mask_path: Path,
+) -> dict[str, str]:
+    artifacts = attempt.get("artifacts", {})
+    default_output_dataset_tag = (
+        str(config_metadata["output_dataset_tag"])
+        if bool(config_metadata["publication_enabled"])
+        and config_metadata["output_dataset_tag"] is not None
+        else str(artifacts["next_recover_request_name"])
+    )
+    default_pycfg_params = merge_pycfg_params(
+        list(cfg_field(parsed_config, "JobType", "pyCfgParams", default=[])),
+        DEFAULT_RECOVERY_PYCFG_PARAM_OVERRIDES,
+    )
     return {
-        "request_name": str(request_name),
-        "units_per_job": int(units_per_job),
-        "publication_enabled": bool(getattr(data, "publication", False)),
-        "output_dataset_tag": getattr(data, "outputDatasetTag", None),
-        "lumi_mask": getattr(data, "lumiMask", None),
+        "__REQUEST_NAME__": repr(str(artifacts["next_recover_request_name"])),
+        "__RECOVERY_LUMI_MASK__": repr(str(lumi_mask_path)),
+        "__DEFAULT_RECOVERY_UNITS_PER_JOB__": str(DEFAULT_RECOVERY_UNITS_PER_JOB),
+        "__DEFAULT_RECOVERY_SPLITTING__": repr(
+            str(cfg_field(parsed_config, "Data", "splitting", default="LumiBased"))
+        ),
+        "__DEFAULT_RECOVERY_OUTPUT_DATASET_TAG__": repr(default_output_dataset_tag),
+        "__DEFAULT_RECOVERY_PYCFG_PARAMS__": repr(default_pycfg_params),
+        "__DEFAULT_RECOVERY_NUM_CORES__": str(DEFAULT_RECOVERY_NUM_CORES),
+        "__DEFAULT_RECOVERY_MAX_MEMORY_MB__": str(DEFAULT_RECOVERY_MAX_MEMORY_MB),
+        "__DEFAULT_RECOVERY_PUBLICATION__": repr(
+            bool(cfg_field(parsed_config, "Data", "publication", default=False))
+        ),
+        "__DEFAULT_RECOVERY_STORAGE_SITE__": repr(
+            str(cfg_field(parsed_config, "Site", "storageSite", default=""))
+        ),
     }
 
 
@@ -919,7 +977,7 @@ def populate_attempt_metadata(state: dict[str, Any], attempt: dict[str, Any]) ->
     )
     if needs_cfg_load:
         try:
-            metadata = load_cfg_metadata_via_runpy(cfg_path)
+            metadata = load_cfg_metadata(cfg_path)
         except Exception:
             if config_metadata is None:
                 raise
@@ -1165,19 +1223,10 @@ def render_recovery_config(attempt: dict[str, Any], template_path: Path) -> Path
     cfg_path = Path(str(attempt["cfg_path"])).resolve()
     config_metadata = attempt_config_metadata(attempt)
     if config_metadata is None:
-        config_metadata = build_attempt_config_metadata(
-            load_cfg_metadata_via_runpy(cfg_path)
-        )
+        config_metadata = build_attempt_config_metadata(load_cfg_metadata(cfg_path))
+    parsed_original = original_literal_config(cfg_path)
     recovery = attempt.get("recovery", {})
     artifacts = attempt.get("artifacts", {})
-
-    original_units = int(config_metadata["units_per_job"])
-    publication_enabled = bool(config_metadata["publication_enabled"])
-    default_output_dataset_tag = (
-        str(config_metadata["output_dataset_tag"])
-        if publication_enabled and config_metadata["output_dataset_tag"] is not None
-        else str(artifacts["next_recover_request_name"])
-    )
 
     compact_mask = recovery.get("resolved_lumi_mask")
     if compact_mask is None:
@@ -1185,18 +1234,10 @@ def render_recovery_config(attempt: dict[str, Any], template_path: Path) -> Path
     lumi_mask_path = write_compact_lumi_mask_file(
         compact_mask, Path(str(artifacts["next_planned_lumi_mask_file"])).resolve()
     )
-    replacements = {
-        "__ORIGINAL_CONFIG__": repr(str(cfg_path)),
-        "__ORIGINAL_REQUEST_NAME__": repr(str(attempt["request_name"])),
-        "__REQUEST_NAME__": repr(str(artifacts["next_recover_request_name"])),
-        "__LUMI_MASK__": repr(str(lumi_mask_path)),
-        "__UNITS_PER_JOB__": str(original_units),
-        "__DEFAULT_OUTPUT_DATASET_TAG__": repr(default_output_dataset_tag),
-    }
-
-    rendered = template_path.read_text()
-    for key, value in replacements.items():
-        rendered = rendered.replace(key, value)
+    replacements = build_recovery_replacements(
+        attempt, parsed_original, config_metadata, lumi_mask_path
+    )
+    rendered = render_template(template_path.read_text(), replacements)
 
     unresolved = sorted(set(re.findall(r"__[A-Z0-9_]+__", rendered)))
     if unresolved:
@@ -1205,9 +1246,11 @@ def render_recovery_config(attempt: dict[str, Any], template_path: Path) -> Path
             f"{cfg_path}: {unresolved}"
         )
 
+    parsed_template = parse_literal_crab_config(rendered, source_name=str(template_path))
+    merged = merge_literal_assignments(parsed_original, parsed_template)
     output_path = Path(str(artifacts["next_recover_cfg"])).resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(rendered)
+    output_path.write_text(emit_wmcore_crab_config(merged))
     return output_path
 
 
@@ -1257,11 +1300,11 @@ def render_all(args: argparse.Namespace) -> int:
 
 
 def load_cfg_lumi_mask(cfg_path: Path) -> Any:
-    return load_cfg_metadata_via_runpy(cfg_path)["lumi_mask"]
+    return load_cfg_metadata(cfg_path)["lumi_mask"]
 
 
 def load_cfg_request_name(cfg_path: Path) -> str:
-    return str(load_cfg_metadata_via_runpy(cfg_path)["request_name"])
+    return str(load_cfg_metadata(cfg_path)["request_name"])
 
 
 def expected_child_lumi_mask(attempt: dict[str, Any]) -> tuple[str, Any | None]:
@@ -1419,7 +1462,7 @@ def record_submission(args: argparse.Namespace) -> int:
     artifacts = attempt["artifacts"]
     child_task_dir = str(artifacts["next_child_task_dir"])
     child_cfg_path = Path(str(artifacts["next_recover_cfg"])).resolve()
-    child_cfg_metadata = load_cfg_metadata_via_runpy(child_cfg_path)
+    child_cfg_metadata = load_cfg_metadata(child_cfg_path)
     child_spec = child_append_spec(
         attempt,
         child_task_dir=child_task_dir,
@@ -1452,7 +1495,7 @@ def add_to_chain(args: argparse.Namespace) -> int:
 
     attempt = find_attempt(state, args.parent_task)
     child_cfg_path = Path(args.child_cfg).resolve()
-    child_cfg_metadata = load_cfg_metadata_via_runpy(child_cfg_path)
+    child_cfg_metadata = load_cfg_metadata(child_cfg_path)
     child_lumi_mask = child_cfg_metadata["lumi_mask"]
     child_request_name = str(child_cfg_metadata["request_name"])
     source = validate_child_coverage_against_parent(

@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import json
 import importlib.util
+import io
 import subprocess
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
 MODULE_PATH = Path(__file__).with_name("crab_status_snapshot.py")
@@ -57,7 +59,22 @@ class CrabStatusSnapshotTest(unittest.TestCase):
                 json.dumps(
                     {
                         "query_failures": ["crab_task_a"],
-                        "attempts": {},
+                        "families": {
+                            "crab_task_a": {
+                                "root_task_dir": "crab_task_a",
+                                "attempt_order": ["crab_task_a"],
+                                "latest_attempt_id": "crab_task_a",
+                            }
+                        },
+                        "attempts": {
+                            "crab_task_a": {
+                                "task_dir": "crab_task_a",
+                                "status": {
+                                    "failed_job_ids": ["7"],
+                                    "failed_job_count": 1,
+                                },
+                            }
+                        },
                     }
                 )
             )
@@ -86,6 +103,45 @@ class CrabStatusSnapshotTest(unittest.TestCase):
             args = type("Args", (), {"state_file": str(state_path), "summary_file": None})
             with tempfile.TemporaryDirectory() as _:
                 self.assertEqual(snapshot.run_list_failed(args), 0)
+
+    def test_list_failed_only_emits_latest_chain_attempts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "latest_state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "query_failures": ["crab_task"],
+                        "families": {
+                            "crab_task": {
+                                "root_task_dir": "crab_task",
+                                "attempt_order": ["crab_task", "crab_task__recover1"],
+                                "latest_attempt_id": "crab_task__recover1",
+                            }
+                        },
+                        "attempts": {
+                            "crab_task": {
+                                "task_dir": "crab_task",
+                                "status": {
+                                    "failed_job_ids": ["3"],
+                                    "failed_job_count": 1,
+                                },
+                            },
+                            "crab_task__recover1": {
+                                "task_dir": "crab_task__recover1",
+                                "status": {
+                                    "failed_job_ids": ["7", "9"],
+                                    "failed_job_count": 2,
+                                },
+                            },
+                        },
+                    }
+                )
+            )
+            args = type("Args", (), {"state_file": str(state_path), "summary_file": None})
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                self.assertEqual(snapshot.run_list_failed(args), 0)
+            self.assertEqual(stdout.getvalue().strip(), "crab_task__recover1\t7,9\t2")
 
     def test_build_task_summary_treats_killed_without_json_as_header_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

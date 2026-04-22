@@ -201,21 +201,22 @@ Outputs:
 Recovery overrides:
 
 - Edit `crab3_recovery_template.py` when you need recovery-specific overrides
-  such as `Data.unitsPerJob`, `Data.splitting`,
-  `RECOVERY_PYCFG_PARAM_OVERRIDES`,
-  `JobType.numCores`, `JobType.maxMemoryMB`, or other dotted `config.*` fields.
-- Leave an override as `None` to keep the builder-provided default inherited
-  from the original task.
+  such as `Data.unitsPerJob`, `Data.splitting`, `Data.publication`,
+  `JobType.pyCfgParams`, `JobType.numCores`, `JobType.maxMemoryMB`, or other
+  direct `config.<Section>.<field>` assignments.
+- The recovery template now uses normal CRAB config syntax, not `RECOVERY_*`
+  overlay variables. Edit the direct `config.*` assignments in the template or
+  add new literal `config.*` assignments as needed.
 - Re-run `./prepare_recovery_tasks.sh` or
   `./crab_recovery_task_builder.py render-all ...` after editing the template so
   the generated recovery configs under `recovery_cache/configs/` pick up the
-  new overlay values.
-- `RECOVERY_PYCFG_PARAM_OVERRIDES` merges into the original task
-  `config.JobType.pyCfgParams`: existing keys are replaced in place and new keys
-  are appended.
-- If you truly need a full manual replacement for `JobType.pyCfgParams`, use the
-  generic `RECOVERY_OVERRIDES` escape hatch with
-  `"JobType.pyCfgParams": [...]`.
+  new direct config values.
+- The builder preserves literal `config.<Section>.<field>` assignments from the
+  original task config and applies the literal assignments from
+  `crab3_recovery_template.py` on top, so fields not restated in the recovery
+  template remain inherited automatically.
+- `JobType.pyCfgParams` in the recovery template is a direct list assignment.
+  Multiline literal lists are supported; computed Python logic is not.
 - During actual recovery execution, normal tasks preserve
   `results/notFinishedLumis.json` into `recovery_cache/reports/<task>/` before
   the original task is killed. The rendered recovery config then uses that
@@ -403,11 +404,11 @@ DRY_RUN=0 ./submit.sh
   of a new config that reuses the original task settings with a new request
   name and the preserved not-finished lumi coverage.
 - The generated recovery config is now rendered through
-  `crab3_recovery_template.py`, which acts as the supported overlay layer for
-  recovery-only changes. That template can override the default inherited
-  `unitsPerJob`, splitting mode, CRAB job resources, keyed `pyCfgParams`, and
-  arbitrary dotted `config.*` assignments without modifying either
-  `crab3_template.py` or the original task config.
+  `crab3_recovery_template.py`, which now uses the same direct WMCore-style
+  CRAB syntax as the original template. The builder parses literal
+  `config.<Section>.<field>` assignments from both the original config and the
+  recovery template, preserves inherited original fields, and emits a merged
+  recovery config without executing either file.
 - Recovery lumi comparison and manual chain validation use the CMSSW
   `FWCore.PythonUtilities.LumiList` implementation rather than raw path
   equality. Equivalent lumi masks written in different compact forms therefore

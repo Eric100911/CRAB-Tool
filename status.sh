@@ -9,6 +9,7 @@ MANIFEST="${CRAB_MANIFEST:-generated_crab_configs.txt}"
 STATUS_CACHE_DIR="${STATUS_CACHE_DIR:-status_cache}"
 STATE_FILE="${STATUS_CACHE_DIR}/latest_state.json"
 CLI_RAW_STATUS=""
+CHAIN_SCOPE="latest"
 SHOW_HELP=0
 declare -a FORWARD_ARGS=()
 
@@ -16,19 +17,22 @@ show_help() {
     cat <<'EOF'
 Usage: ./status.sh [options] [-- crab status options]
 
-Query CRAB status for every task in the manifest.
+Query CRAB status for the tasks tracked by the manifest and recovery chains.
 
-By default this wrapper uses crab_status_snapshot.py collect to create a cached,
-machine-readable state file under status_cache/latest_state.json. Use
---raw-status to call
-"crab status" directly for each task instead.
+By default this wrapper uses crab_status_snapshot.py query-latest to refresh the
+cached latest-attempt view under status_cache/latest_state.json. Use
+--all-chain-attempts to refresh every tracked attempt in each recovery chain.
+Use --raw-status to query CRAB live without updating the cache.
 
 Options:
   -h, --help            Show this help text and exit.
   --manifest PATH       Manifest file to read. Falls back to CRAB_MANIFEST.
   --cache-dir PATH      Status cache directory. Falls back to STATUS_CACHE_DIR.
-  --raw-status          Bypass the JSON cache flow and call crab status directly.
-  --cached-status       Force the JSON cache flow even if RAW_STATUS is set.
+  --raw-status          Query CRAB live and do not update latest_state.json.
+  --cached-status       Force cache-updating mode even if RAW_STATUS is set.
+  --all-chain-attempts  Query every tracked attempt in each recovery chain.
+  --latest-chain-attempts
+                        Query only the latest attempt in each recovery chain.
   --                    Stop parsing wrapper options and pass the rest through.
 
 Environment fallback:
@@ -37,16 +41,17 @@ Environment fallback:
   RAW_STATUS            Default raw-vs-cached mode (accepted values: 0/1/true/false).
 
 Preconditions:
-  - Run 'cmsenv' in this CMSSW work area first.
-  - Export X509_USER_PROXY before querying CRAB.
+  - The Python backend enforces 'cmsenv' and X509_USER_PROXY for live queries.
 
 Passthrough:
-  - In cached mode, extra arguments are forwarded to crab_status_snapshot.py collect.
-  - In raw mode, extra arguments are forwarded to crab status for each task.
+  - In cache-updating mode, extra arguments are forwarded to crab_status_snapshot.py
+    and then to 'crab status --json'.
+  - In raw mode, extra arguments are forwarded to 'crab status'.
   - Use '--' to disambiguate wrapper options from passthrough options when needed.
 
 Examples:
   ./status.sh
+  ./status.sh --all-chain-attempts
   ./status.sh --cache-dir custom_status_cache
   ./status.sh --raw-status -- --verboseErrors
 EOF
@@ -76,6 +81,14 @@ while (($#)); do
             CLI_RAW_STATUS=0
             shift
             ;;
+        --all-chain-attempts)
+            CHAIN_SCOPE="all"
+            shift
+            ;;
+        --latest-chain-attempts)
+            CHAIN_SCOPE="latest"
+            shift
+            ;;
         --)
             shift
             FORWARD_ARGS=("$@")
@@ -94,25 +107,24 @@ if [[ "${SHOW_HELP}" == "1" ]]; then
 fi
 
 RAW_STATUS="$(resolve_bool "RAW_STATUS" "${CLI_RAW_STATUS}" "${RAW_STATUS:-}" "0")"
-
-require_cmssw_env
-require_manifest "${MANIFEST}"
-require_proxy_env
-
-if [[ "${RAW_STATUS}" == "1" ]]; then
-    while read -r cfg; do
-        [[ -n "${cfg}" ]] || continue
-        task_dir="$(cfg_to_task_dir "${cfg}")"
-        cmd=(crab status -d "${task_dir}")
-        if ((${#FORWARD_ARGS[@]} > 0)); then
-            cmd+=("${FORWARD_ARGS[@]}")
-        fi
-        "${cmd[@]}"
-    done < "${MANIFEST}"
-    exit 0
+STATE_FILE="${STATUS_CACHE_DIR}/latest_state.json"
+subcommand="query-latest"
+if [[ "${CHAIN_SCOPE}" == "all" ]]; then
+    subcommand="query-all"
 fi
 
-exec python3 crab_status_snapshot.py collect \
-    --manifest "${MANIFEST}" \
-    --state-file "${STATE_FILE}" \
-    "${FORWARD_ARGS[@]}"
+declare -a SNAPSHOT_ARGS=(
+    "${subcommand}"
+    --manifest "${MANIFEST}"
+    --state-file "${STATE_FILE}"
+)
+
+if [[ "${RAW_STATUS}" == "1" ]]; then
+    SNAPSHOT_ARGS+=(--no-update-cache --raw-output)
+fi
+
+if ((${#FORWARD_ARGS[@]} > 0)); then
+    SNAPSHOT_ARGS+=(-- "${FORWARD_ARGS[@]}")
+fi
+
+exec python3 crab_status_snapshot.py "${SNAPSHOT_ARGS[@]}"

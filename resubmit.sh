@@ -13,24 +13,12 @@ STATE_FILE="${STATUS_CACHE_DIR}/latest_state.json"
 SHOW_HELP=0
 declare -a FORWARD_ARGS=()
 
-declare -a failed_tasks=()
-
-is_no_jobs_to_resubmit_output() {
-    local output="$1"
-    local normalized
-    normalized="$(printf '%s' "${output}" | tr '[:upper:]' '[:lower:]')"
-    [[ "${normalized}" == *"no jobs to resubmit"* ]] ||
-        [[ "${normalized}" == *"nothing to resubmit"* ]] ||
-        [[ "${normalized}" == *"don't have jobs to resubmit"* ]] ||
-        [[ "${normalized}" == *"doesn't have jobs to resubmit"* ]]
-}
-
 show_help() {
     cat <<'EOF'
 Usage: ./resubmit.sh [options] [-- crab resubmit options]
 
-Refresh the cached task status if needed, then resubmit only the failed CRAB
-jobs for tasks that currently contain failures in the unified state file.
+Refresh the cached latest-attempt task status if needed, then resubmit only the
+failed CRAB jobs recorded in latest_state.json.
 
 Options:
   -h, --help              Show this help text and exit.
@@ -49,8 +37,7 @@ Environment fallback:
   USE_CACHED_STATUS       Default cache reuse mode (accepted values: 0/1/true/false).
 
 Preconditions:
-  - Run 'cmsenv' in this CMSSW work area first.
-  - Export X509_USER_PROXY before resubmitting jobs.
+  - The Python backend enforces 'cmsenv' and X509_USER_PROXY before resubmitting.
 
 Examples:
   ./resubmit.sh
@@ -111,62 +98,25 @@ fi
 DRY_RUN="$(resolve_bool "DRY_RUN" "${CLI_DRY_RUN}" "${DRY_RUN:-}" "1")"
 USE_CACHED_STATUS="$(resolve_bool "USE_CACHED_STATUS" "${CLI_USE_CACHED_STATUS}" "${USE_CACHED_STATUS:-}" "0")"
 STATE_FILE="${STATUS_CACHE_DIR}/latest_state.json"
+declare -a RESUBMIT_ARGS=(
+    --manifest "${MANIFEST}"
+    --state-file "${STATE_FILE}"
+)
 
-require_cmssw_env
-require_manifest "${MANIFEST}"
-require_proxy_env
-
-if [[ "${USE_CACHED_STATUS}" != "1" || ! -f "${STATE_FILE}" ]]; then
-    ./status.sh --manifest "${MANIFEST}" --cache-dir "${STATUS_CACHE_DIR}"
+if [[ "${DRY_RUN}" == "1" ]]; then
+    RESUBMIT_ARGS+=(--dry-run)
+else
+    RESUBMIT_ARGS+=(--execute)
 fi
 
-if ! failed_output="$(
-    python3 crab_status_snapshot.py list-failed --state-file "${STATE_FILE}"
-)"; then
-    exit 1
+if [[ "${USE_CACHED_STATUS}" == "1" ]]; then
+    RESUBMIT_ARGS+=(--use-cached-status)
+else
+    RESUBMIT_ARGS+=(--refresh-status)
 fi
 
-if [[ -z "${failed_output}" ]]; then
-    echo "No failed jobs found in status snapshot."
-    exit 0
+if ((${#FORWARD_ARGS[@]} > 0)); then
+    RESUBMIT_ARGS+=(-- "${FORWARD_ARGS[@]}")
 fi
 
-mapfile -t failed_entries < <(printf '%s\n' "${failed_output}")
-
-for entry in "${failed_entries[@]}"; do
-    IFS=$'\t' read -r task_dir failed_job_ids failed_count <<< "${entry}"
-    [[ -n "${task_dir}" ]] || continue
-
-    cmd=(crab resubmit -d "${task_dir}" --jobids "${failed_job_ids}")
-    if ((${#FORWARD_ARGS[@]} > 0)); then
-        cmd+=("${FORWARD_ARGS[@]}")
-    fi
-
-    if [[ "${DRY_RUN}" == "1" ]]; then
-        printf '[failed=%s] ' "${failed_count}"
-        printf '%q ' "${cmd[@]}"
-        printf '\n'
-        continue
-    fi
-
-    if output="$("${cmd[@]}" 2>&1)"; then
-        printf '%s\n' "${output}"
-        continue
-    fi
-
-    if is_no_jobs_to_resubmit_output "${output}"; then
-        printf '%s\n' "${output}"
-        echo "Skipping ${task_dir}: no jobs to resubmit."
-        continue
-    fi
-
-    printf '%s\n' "${output}" >&2
-    echo "Resubmit failed for ${task_dir}." >&2
-    failed_tasks+=("${task_dir}")
-done
-
-if (( ${#failed_tasks[@]} > 0 )); then
-    printf 'Resubmit failures in %d task(s):\n' "${#failed_tasks[@]}" >&2
-    printf '  %s\n' "${failed_tasks[@]}" >&2
-    exit 1
-fi
+exec python3 crab_resubmit.py "${RESUBMIT_ARGS[@]}"

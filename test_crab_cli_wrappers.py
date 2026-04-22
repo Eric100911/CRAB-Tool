@@ -15,11 +15,20 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 SUBMIT_SH = SCRIPT_DIR / "submit.sh"
 RESUBMIT_SH = SCRIPT_DIR / "resubmit.sh"
+STATUS_SH = SCRIPT_DIR / "status.sh"
 PREPARE_RECOVERY_SH = SCRIPT_DIR / "prepare_recovery_tasks.sh"
 KILL_RECOVER_SH = SCRIPT_DIR / "kill_unfinished_and_submit_recover.sh"
 STATUS_SNAPSHOT_PY = SCRIPT_DIR / "crab_status_snapshot.py"
+RESUBMIT_PY = SCRIPT_DIR / "crab_resubmit.py"
 RECOVERY_BUILDER_PY = SCRIPT_DIR / "crab_recovery_task_builder.py"
 ROOT_COMPACT_MASK = {"1": [[1, 5]]}
+SAMPLE_STATUS_OUTPUT = """CRAB project directory:\t\t/path/to/crab_task
+Task name:\t\t\t260411_080042:chiw_crab_task
+Status on the CRAB server:\tSUBMITTED
+Status on the scheduler:\tSUBMITTED
+
+{"1": {"State": "finished", "Error": [0, "OK", {}]}, "2": {"State": "failed", "Error": [8020, "File open error", {}]}}
+"""
 
 
 def install_fake_wmcore(root: Path) -> None:
@@ -406,7 +415,94 @@ class CrabCliWrapperTest(unittest.TestCase):
             )
             self.assertEqual(completed.returncode, 0, msg=completed.stderr)
             self.assertIn(f"crab resubmit -d {task_dir} --jobids", completed.stdout)
-            self.assertIn("7\\,9", completed.stdout)
+            self.assertIn("7,9", completed.stdout)
+
+    def test_status_defaults_to_query_latest_chain_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            proxy_path, crab_log = make_fake_tools(tmp)
+            cfg_path = tmp / "sample_cfg.py"
+            cfg_path.write_text("# config\n")
+            manifest_path = tmp / "manifest.txt"
+            manifest_path.write_text(f"{cfg_path}\n")
+            state_path = tmp / "status_cache" / "latest_state.json"
+            state_path.parent.mkdir()
+            child_task_dir = tmp / "crab_sample_cfg__recover1"
+            child_task_dir.mkdir()
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "cwd": str(tmp),
+                        "families": {
+                            "crab_sample_cfg": {
+                                "root_task_dir": "crab_sample_cfg",
+                                "root_cfg": str(cfg_path),
+                                "attempt_order": [
+                                    "crab_sample_cfg",
+                                    "crab_sample_cfg__recover1",
+                                ],
+                                "latest_attempt_id": "crab_sample_cfg__recover1",
+                            }
+                        },
+                        "attempts": {
+                            "crab_sample_cfg": {
+                                "task_dir": "crab_sample_cfg",
+                                "task_path": str(tmp / "crab_sample_cfg"),
+                                "cfg": str(cfg_path),
+                                "cfg_path": str(cfg_path),
+                                "request_name": "sample_cfg",
+                                "family_id": "crab_sample_cfg",
+                                "parent_attempt_id": None,
+                                "generation": 0,
+                                "status": {"status_collection_state": "ok_json"},
+                                "recovery": {},
+                            },
+                            "crab_sample_cfg__recover1": {
+                                "task_dir": "crab_sample_cfg__recover1",
+                                "task_path": str(child_task_dir),
+                                "cfg": str(cfg_path),
+                                "cfg_path": str(cfg_path),
+                                "request_name": "sample_cfg__recover1",
+                                "family_id": "crab_sample_cfg",
+                                "parent_attempt_id": "crab_sample_cfg",
+                                "generation": 1,
+                                "status": {"status_collection_state": "ok_json"},
+                                "recovery": {},
+                            },
+                        },
+                    }
+                )
+            )
+
+            env = self.base_env()
+            env.update(
+                {
+                    "PATH": f"{tmp / 'bin'}:{env['PATH']}",
+                    "X509_USER_PROXY": str(proxy_path),
+                    "FAKE_PROXY_PATH": str(proxy_path),
+                    "FAKE_CRAB_LOG": str(crab_log),
+                    "FAKE_CRAB_STATUS_OUTPUT": SAMPLE_STATUS_OUTPUT,
+                    "CMSSW_BASE": "/tmp/cmssw",
+                    "CMSSW_RELEASE_BASE": "/tmp/cmssw_release",
+                    "SCRAM_ARCH": "el9_amd64_gcc13",
+                }
+            )
+
+            completed = self.run_command(
+                [
+                    "bash",
+                    str(STATUS_SH),
+                    "--manifest",
+                    str(manifest_path),
+                    "--cache-dir",
+                    str(state_path.parent),
+                ],
+                env=env,
+            )
+            self.assertEqual(completed.returncode, 0, msg=completed.stderr)
+            crab_calls = crab_log.read_text()
+            self.assertIn(f"status -d {child_task_dir} --json", crab_calls)
+            self.assertNotIn(f"status -d {tmp / 'crab_sample_cfg'} --json", crab_calls)
 
     def test_python_help_keeps_status_available_but_recovery_builder_needs_cmsenv(self) -> None:
         env = self.base_env()
@@ -422,6 +518,12 @@ class CrabCliWrapperTest(unittest.TestCase):
         )
         self.assertNotEqual(recovery_help.returncode, 0)
         self.assertIn("FWCore.PythonUtilities.LumiList", recovery_help.stderr)
+
+        resubmit_help = self.run_command(
+            [sys.executable, str(RESUBMIT_PY), "--help"], env=env
+        )
+        self.assertEqual(resubmit_help.returncode, 0)
+        self.assertIn("--use-cached-status", resubmit_help.stdout)
 
     def test_kill_recover_dry_run_reports_before_kill_for_normal_tasks(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
