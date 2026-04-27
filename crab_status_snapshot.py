@@ -384,6 +384,23 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def is_killed_server_status(server_status: str | None) -> bool:
+    return (server_status or "").strip().upper() == "KILLED"
+
+
+def is_holding_resubmit_server_status(server_status: str | None) -> bool:
+    return (server_status or "").strip().upper().startswith(
+        "HOLDING ON COMMAND RESUBMIT"
+    )
+
+
+def is_resubmit_eligible_status(status: dict[str, Any]) -> bool:
+    server_status = status.get("server_status")
+    return not is_killed_server_status(server_status) and not is_holding_resubmit_server_status(
+        server_status
+    )
+
+
 def hash_payload(payload: dict[str, Any]) -> str:
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
@@ -425,6 +442,7 @@ def ensure_state_shape(state: dict[str, Any]) -> dict[str, Any]:
         attempt.setdefault("planned_lumi_source", None)
         attempt.setdefault("status_revision", None)
         attempt.setdefault("status", {"status_collection_state": STATUS_COLLECTION_NOT_COLLECTED})
+        attempt["status"].setdefault("hold_since", None)
         attempt.setdefault("recovery", {})
     return state
 
@@ -458,6 +476,7 @@ def make_status_payload(
         "status_collection_state": summary.get("status_collection_state"),
         "query_error": summary.get("query_error"),
         "query_warning": summary.get("query_warning"),
+        "hold_since": None,
         "job_count": int(summary.get("job_count", 0)),
         "job_states": dict(summary.get("job_states", {})),
         "failed_job_count": int(summary.get("failed_job_count", 0)),
@@ -504,6 +523,16 @@ def merge_attempt_status(
     recovery = dict(existing_attempt.get("recovery", {}))
     if recovery.get("derived_from_revision") != status_revision:
         recovery = clear_stale_recovery(recovery)
+    existing_status = dict(existing_attempt.get("status", {}))
+    if is_holding_resubmit_server_status(status.get("server_status")):
+        if is_holding_resubmit_server_status(existing_status.get("server_status")):
+            status["hold_since"] = existing_status.get("hold_since") or status.get(
+                "collected_at"
+            )
+        else:
+            status["hold_since"] = status.get("collected_at")
+    else:
+        status["hold_since"] = None
 
     return {
         **existing_attempt,
@@ -827,6 +856,8 @@ def iter_latest_failed_entries(
     for task_dir_name in latest_attempt_ids(state):
         attempt = state["attempts"][task_dir_name]
         status = attempt.get("status", {})
+        if not is_resubmit_eligible_status(status):
+            continue
         failed_job_ids = [str(job_id) for job_id in status.get("failed_job_ids", [])]
         if not failed_job_ids:
             continue

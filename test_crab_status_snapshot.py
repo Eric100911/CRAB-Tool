@@ -143,6 +143,56 @@ class CrabStatusSnapshotTest(unittest.TestCase):
                 self.assertEqual(snapshot.run_list_failed(args), 0)
             self.assertEqual(stdout.getvalue().strip(), "crab_task__recover1\t7,9\t2")
 
+    def test_iter_latest_failed_entries_skips_killed_and_holding_tasks(self) -> None:
+        state = snapshot.ensure_state_shape(
+            {
+                "families": {
+                    "crab_a": {
+                        "root_task_dir": "crab_a",
+                        "attempt_order": ["crab_a"],
+                        "latest_attempt_id": "crab_a",
+                    },
+                    "crab_b": {
+                        "root_task_dir": "crab_b",
+                        "attempt_order": ["crab_b"],
+                        "latest_attempt_id": "crab_b",
+                    },
+                    "crab_c": {
+                        "root_task_dir": "crab_c",
+                        "attempt_order": ["crab_c"],
+                        "latest_attempt_id": "crab_c",
+                    },
+                },
+                "attempts": {
+                    "crab_a": {
+                        "task_dir": "crab_a",
+                        "status": {
+                            "server_status": "SUBMITTED",
+                            "failed_job_ids": ["3", "5"],
+                            "failed_job_count": 2,
+                        },
+                    },
+                    "crab_b": {
+                        "task_dir": "crab_b",
+                        "status": {
+                            "server_status": "KILLED",
+                            "failed_job_ids": ["7"],
+                            "failed_job_count": 1,
+                        },
+                    },
+                    "crab_c": {
+                        "task_dir": "crab_c",
+                        "status": {
+                            "server_status": "HOLDING on command RESUBMIT",
+                            "failed_job_ids": ["9"],
+                            "failed_job_count": 1,
+                        },
+                    },
+                },
+            }
+        )
+        self.assertEqual(snapshot.iter_latest_failed_entries(state), [("crab_a", ["3", "5"], 2)])
+
     def test_build_task_summary_treats_killed_without_json_as_header_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             task_dir = Path(tmpdir) / "crab_task"
@@ -222,6 +272,40 @@ class CrabStatusSnapshotTest(unittest.TestCase):
             status,
         )
         self.assertIsNone(attempt["recovery"]["resolved_lumi_mask"])
+
+    def test_merge_attempt_status_preserves_hold_since_while_holding(self) -> None:
+        status = snapshot.make_status_payload(
+            {
+                "cfg": "sample.py",
+                "task_dir": "crab_sample",
+                "task_path": "/tmp/crab_sample",
+                "task_name": "task",
+                "server_status": "HOLDING on command RESUBMIT",
+                "scheduler_status": "FAILED",
+                "dashboard_url": None,
+                "job_count": 1,
+                "job_states": {"failed": 1},
+                "failed_job_count": 1,
+                "failed_job_ids": ["1"],
+                "status_collection_state": snapshot.STATUS_COLLECTION_OK,
+                "query_error": None,
+                "query_warning": None,
+            },
+            {"1": {"State": "failed"}},
+        )
+        attempt = snapshot.merge_attempt_status(
+            {
+                "request_name": "sample",
+                "status": {
+                    "server_status": "HOLDING on command RESUBMIT",
+                    "hold_since": "2026-04-22T15:30:12+00:00",
+                },
+            },
+            "sample.py",
+            Path("/tmp/crab_sample"),
+            status,
+        )
+        self.assertEqual(attempt["status"]["hold_since"], "2026-04-22T15:30:12+00:00")
 
 
 if __name__ == "__main__":

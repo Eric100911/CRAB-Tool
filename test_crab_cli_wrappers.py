@@ -620,7 +620,7 @@ class CrabCliWrapperTest(unittest.TestCase):
             self.assertIn("cp -f", lines[1])
             self.assertIn("crab kill -d", lines[2])
 
-    def test_kill_recover_dry_run_skips_kill_for_killed_candidates(self) -> None:
+    def test_kill_recover_dry_run_reports_first_for_killed_candidates(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             proxy_path, crab_log = make_fake_tools(tmp)
@@ -711,7 +711,8 @@ class CrabCliWrapperTest(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, msg=completed.stderr)
             lines = [line for line in completed.stdout.splitlines() if line.startswith("[")]
             self.assertGreaterEqual(len(lines), 5)
-            self.assertIn("preserve-if-present", lines[0])
+            self.assertIn("crab report -d", lines[0])
+            self.assertIn("preserve-if-present", completed.stdout)
             self.assertNotIn("crab kill -d", completed.stdout)
 
     def test_kill_recover_execute_falls_back_to_original_mask_when_report_has_no_not_finished_and_no_jobs_finished(self) -> None:
@@ -763,7 +764,10 @@ class CrabCliWrapperTest(unittest.TestCase):
                 env=env,
             )
             self.assertEqual(completed.returncode, 0, msg=completed.stderr)
-            self.assertIn("No notFinishedLumis.json produced", completed.stderr)
+            self.assertIn(
+                "No fresh notFinishedLumis.json produced",
+                completed.stderr,
+            )
 
             crab_commands = crab_log.read_text()
             self.assertIn(f"status -d {task_path}", crab_commands)
@@ -779,7 +783,7 @@ class CrabCliWrapperTest(unittest.TestCase):
             self.assertEqual(task["recovery"]["resolved_lumi_source"], "parent_planned_lumi_mask_no_finished_jobs")
             self.assertEqual(task["recovery"]["resolved_lumi_mask"], ROOT_COMPACT_MASK)
 
-    def test_kill_recover_execute_skips_report_and_kill_when_runtime_status_is_killed(self) -> None:
+    def test_kill_recover_execute_runs_report_but_skips_kill_when_runtime_status_is_killed(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             proxy_path, crab_log = make_fake_tools(tmp)
@@ -830,7 +834,7 @@ class CrabCliWrapperTest(unittest.TestCase):
 
             crab_commands = crab_log.read_text()
             self.assertIn(f"status -d {task_path}", crab_commands)
-            self.assertNotIn(f"report -d {task_path}", crab_commands)
+            self.assertIn(f"report -d {task_path}", crab_commands)
             self.assertNotIn(f"kill -d {task_path}", crab_commands)
             self.assertIn(
                 f"submit -c {recovery_cache_dir / 'configs' / 'sample_cfg__recover1.py'}",

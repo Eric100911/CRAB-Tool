@@ -49,7 +49,12 @@ STATUS_COLLECTION_OK = "ok_json"
 STATUS_COLLECTION_HEADER_ONLY_KILLED = "header_only_killed"
 STATUS_COLLECTION_FATAL_ERROR = "fatal_error"
 STATUS_COLLECTION_NOT_COLLECTED = "not_collected"
-RECOVERY_RENDER_CLASSES = {"recovery_candidate", "mixed", "killed_recovery_candidate"}
+RECOVERY_RENDER_CLASSES = {
+    "recovery_candidate",
+    "mixed",
+    "killed_recovery_candidate",
+    "holding_resubmit_recovery_candidate",
+}
 DEFAULT_RECOVERY_UNITS_PER_JOB = 100
 DEFAULT_RECOVERY_NUM_CORES = 1
 DEFAULT_RECOVERY_MAX_MEMORY_MB = 2000
@@ -360,6 +365,27 @@ def parse_snapshot_time(raw: str | None) -> datetime:
     if raw:
         return datetime.fromisoformat(raw)
     return datetime.now(timezone.utc)
+
+
+def is_killed_server_status(server_status: str | None) -> bool:
+    return (server_status or "").strip().upper() == "KILLED"
+
+
+def is_holding_resubmit_server_status(server_status: str | None) -> bool:
+    return (server_status or "").strip().upper().startswith(
+        "HOLDING ON COMMAND RESUBMIT"
+    )
+
+
+def hold_age_hours(status: dict[str, Any], snapshot_time: datetime) -> float | None:
+    raw_hold_since = status.get("hold_since")
+    if not raw_hold_since:
+        return None
+    try:
+        hold_since = datetime.fromisoformat(str(raw_hold_since))
+    except ValueError:
+        return None
+    return (snapshot_time - hold_since).total_seconds() / 3600.0
 
 
 def resolve_cfg_path(crab_data_dir: Path, cfg: str) -> Path:
@@ -1025,6 +1051,8 @@ def derive_recovery_for_attempt(
     snapshot_time = parse_snapshot_time(
         str(status.get("collected_at") or state.get("updated_at") or now_iso())
     )
+    server_status = str(status.get("server_status") or "")
+    scheduler_status = str(status.get("scheduler_status") or "")
     jobs = status.get("jobs") or {}
     if not isinstance(jobs, dict):
         jobs = {}
@@ -1048,10 +1076,26 @@ def derive_recovery_for_attempt(
         if str(job.get("State", "unknown")) in NON_FINISHED_STATES:
             blocking_job_ids.append(str(job_id))
 
+    hold_age = hold_age_hours(status, snapshot_time)
+    if (
+        hold_age is None
+        and is_holding_resubmit_server_status(server_status)
+        and status.get("collected_at")
+    ):
+        hold_age = 0.0
+
     if status_collection_state == STATUS_COLLECTION_FATAL_ERROR:
         classification = "query_error"
-    elif status_collection_state == STATUS_COLLECTION_HEADER_ONLY_KILLED:
-        classification = "killed_recovery_candidate"
+    elif is_killed_server_status(server_status):
+        if scheduler_status.strip().upper() == "COMPLETED":
+            classification = "no_action"
+        else:
+            classification = "killed_recovery_candidate"
+    elif is_holding_resubmit_server_status(server_status):
+        if hold_age is not None and hold_age >= stuck_hours:
+            classification = "holding_resubmit_recovery_candidate"
+        else:
+            classification = "holding_resubmit_pending"
     elif recovery_job_ids and blocking_job_ids:
         classification = "mixed"
     elif recovery_job_ids:
@@ -1078,7 +1122,8 @@ def derive_recovery_for_attempt(
             "blocking_state_counts": count_states(jobs, set(blocking_job_ids)),
             "skipped_jobs_without_time": skipped_jobs_without_time,
             "kill_required": classification != "killed_recovery_candidate"
-            and str(status.get("server_status") or "").upper() != "KILLED",
+            and not is_killed_server_status(server_status),
+            "hold_age_hours": hold_age,
             "derived_from_revision": attempt.get("status_revision"),
             "has_child_attempt": has_child_attempt,
             "executable": (not has_child_attempt)
@@ -1110,6 +1155,8 @@ def refresh_recovery_state(args: argparse.Namespace) -> int:
         "recovery_candidate": 0,
         "mixed": 0,
         "killed_recovery_candidate": 0,
+        "holding_resubmit_recovery_candidate": 0,
+        "holding_resubmit_pending": 0,
         "failed_only": 0,
         "no_action": 0,
         "query_error": 0,
@@ -1146,6 +1193,8 @@ def refresh_recovery_state(args: argparse.Namespace) -> int:
         "Refreshed recovery metadata: "
         f"recovery={counts['recovery_candidate']} "
         f"killed={counts['killed_recovery_candidate']} "
+        f"holding_recovery={counts['holding_resubmit_recovery_candidate']} "
+        f"holding_pending={counts['holding_resubmit_pending']} "
         f"mixed={counts['mixed']} "
         f"failed_only={counts['failed_only']} "
         f"no_action={counts['no_action']}"
@@ -1230,7 +1279,12 @@ def render_recovery_config(attempt: dict[str, Any], template_path: Path) -> Path
 
     compact_mask = recovery.get("resolved_lumi_mask")
     if compact_mask is None:
-        compact_mask = compact_lumi_dict(str(artifacts["preserved_not_finished_lumis"]))
+        resolve_action, resolve_source, compact_mask = resolve_lumi_for_attempt(attempt)
+        if resolve_action != "submit" or not compact_mask:
+            raise RuntimeError(
+                f"Task {attempt['task_dir']} has no resolved recovery lumi mask; "
+                f"lumi resolution returned {resolve_action}:{resolve_source}."
+            )
     lumi_mask_path = write_compact_lumi_mask_file(
         compact_mask, Path(str(artifacts["next_planned_lumi_mask_file"])).resolve()
     )
@@ -1382,7 +1436,11 @@ def list_executable(args: argparse.Namespace) -> int:
     state_path = resolve_state_file_arg(args).resolve()
     state = load_state(state_path)
     ensure_recovery_current(state)
-    include_classes = {"recovery_candidate", "killed_recovery_candidate"}
+    include_classes = {
+        "recovery_candidate",
+        "killed_recovery_candidate",
+        "holding_resubmit_recovery_candidate",
+    }
     if args.include_mixed:
         include_classes.add("mixed")
 

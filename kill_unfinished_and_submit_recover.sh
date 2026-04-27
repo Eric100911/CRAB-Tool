@@ -243,15 +243,15 @@ while IFS=$'\t' read -r task_dir task_path report_dir preserved_not_finished_lum
     task_results_not_finished="${task_path}/results/notFinishedLumis.json"
 
     if [[ "${DRY_RUN}" == "1" ]]; then
+        printf '[%s] ' "${classification}"
+        printf '%q ' "${cmd_report[@]}"
+        printf '\n'
+        printf '[%s] cp -f %q %q\n' \
+            "${classification}" "${task_results_not_finished}" "${preserved_not_finished_lumis}"
         if [[ "${classification}" == "killed_recovery_candidate" ]]; then
             printf '[%s] preserve-if-present %q -> %q\n' \
                 "${classification}" "${task_results_not_finished}" "${preserved_not_finished_lumis}"
         else
-            printf '[%s] ' "${classification}"
-            printf '%q ' "${cmd_report[@]}"
-            printf '\n'
-            printf '[%s] cp -f %q %q\n' \
-                "${classification}" "${task_results_not_finished}" "${preserved_not_finished_lumis}"
             printf '[%s] ' "${classification}"
             printf '%q ' "${cmd_kill[@]}"
             printf '\n'
@@ -277,13 +277,16 @@ while IFS=$'\t' read -r task_dir task_path report_dir preserved_not_finished_lum
     }
     cmd_resolve+=(--runtime-server-status "${runtime_server_status}")
 
-    if [[ "${runtime_server_status}" == "KILLED" ]]; then
+    if ! "${cmd_report[@]}"; then
+        echo "crab report failed for ${task_dir}; falling back to any existing notFinishedLumis.json." >&2
+    fi
+
+    if ! preserve_not_finished_lumis "${task_path}" "${report_dir}"; then
         maybe_preserve_existing_not_finished_lumis "${task_path}" "${report_dir}"
-    else
-        "${cmd_report[@]}"
-        if ! preserve_not_finished_lumis "${task_path}" "${report_dir}"; then
-            echo "No notFinishedLumis.json produced for ${task_dir}; continuing to recovery lumi resolution." >&2
-        fi
+        echo "No fresh notFinishedLumis.json produced for ${task_dir}; continuing to recovery lumi resolution." >&2
+    fi
+
+    if [[ "${runtime_server_status}" != "KILLED" ]]; then
         "${cmd_kill[@]}"
     fi
 

@@ -76,6 +76,67 @@ def render_template_with_attempt(
     )
 
 
+def recovery_state_with_attempt(
+    tmp: Path,
+    *,
+    task_dir: str,
+    server_status: str,
+    scheduler_status: str = "SUBMITTED",
+    job_states: dict[str, dict[str, object]] | None = None,
+    failed_job_count: int = 0,
+    hold_since: str | None = None,
+    status_collection_state: str = builder.STATUS_COLLECTION_OK,
+) -> tuple[dict[str, object], dict[str, object]]:
+    attempt = {
+        "task_dir": task_dir,
+        "cfg": str(tmp / "parent.py"),
+        "cfg_path": str(tmp / "parent.py"),
+        "task_path": str(tmp / task_dir),
+        "request_name": "parent",
+        "family_id": task_dir,
+        "generation": 0,
+        "planned_lumi_mask": ROOT_COMPACT_MASK,
+        "planned_lumi_source": "original_task_lumi_mask",
+        "original_lumi_mask": ROOT_COMPACT_MASK,
+        "config_metadata": {
+            "units_per_job": 40,
+            "publication_enabled": False,
+            "output_dataset_tag": "sample",
+        },
+        "original_units_per_job": 40,
+        "publication_enabled": False,
+        "original_output_dataset_tag": "sample",
+        "status_revision": "sha256:test",
+        "status": {
+            "collected_at": "2026-04-24T03:09:09+00:00",
+            "status_collection_state": status_collection_state,
+            "server_status": server_status,
+            "scheduler_status": scheduler_status,
+            "failed_job_count": failed_job_count,
+            "failed_job_ids": [str(index + 1) for index in range(failed_job_count)],
+            "job_states": {},
+            "jobs": job_states or {},
+            "hold_since": hold_since,
+        },
+        "recovery": {"derived_from_revision": "sha256:test"},
+        "artifacts": {},
+    }
+    state = {
+        "cwd": str(tmp),
+        "updated_at": "2026-04-24T03:09:09+00:00",
+        "families": {
+            task_dir: {
+                "root_task_dir": task_dir,
+                "root_cfg": str(tmp / "parent.py"),
+                "attempt_order": [task_dir],
+                "latest_attempt_id": task_dir,
+            }
+        },
+        "attempts": {task_dir: attempt},
+    }
+    return state, attempt
+
+
 class CrabRecoveryStateBuilderTest(unittest.TestCase):
     def test_refresh_recovery_populates_root_planned_mask_and_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -156,6 +217,79 @@ class CrabRecoveryStateBuilderTest(unittest.TestCase):
             )
             self.assertIn("next_recover_cfg", attempt["artifacts"])
             self.assertIn("next_planned_lumi_mask_file", attempt["artifacts"])
+
+    def test_derive_recovery_marks_killed_failed_payload_as_recovery_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            state, attempt = recovery_state_with_attempt(
+                tmp,
+                task_dir="crab_parent",
+                server_status="KILLED",
+                scheduler_status="FAILED (KILLED)",
+                job_states={
+                    "1": {"State": "failed"},
+                    "2": {"State": "failed"},
+                },
+                failed_job_count=2,
+            )
+            builder.derive_recovery_for_attempt(state, attempt, tmp / "recovery_cache", 48.0, "recover")
+            self.assertEqual(attempt["recovery"]["classification"], "killed_recovery_candidate")
+            self.assertTrue(attempt["recovery"]["executable"])
+            self.assertFalse(attempt["recovery"]["kill_required"])
+
+    def test_derive_recovery_marks_killed_completed_as_no_action(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            state, attempt = recovery_state_with_attempt(
+                tmp,
+                task_dir="crab_parent",
+                server_status="KILLED",
+                scheduler_status="COMPLETED",
+                job_states={
+                    "1": {"State": "finished"},
+                    "2": {"State": "finished"},
+                },
+            )
+            attempt["status"]["job_states"] = {"finished": 2}
+            builder.derive_recovery_for_attempt(state, attempt, tmp / "recovery_cache", 48.0, "recover")
+            self.assertEqual(attempt["recovery"]["classification"], "no_action")
+            self.assertFalse(attempt["recovery"]["executable"])
+
+    def test_derive_recovery_holding_under_threshold_stays_pending(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            state, attempt = recovery_state_with_attempt(
+                tmp,
+                task_dir="crab_parent",
+                server_status="HOLDING on command RESUBMIT",
+                scheduler_status="FAILED",
+                job_states={"1": {"State": "failed"}},
+                failed_job_count=1,
+                hold_since="2026-04-23T12:00:00+00:00",
+            )
+            builder.derive_recovery_for_attempt(state, attempt, tmp / "recovery_cache", 48.0, "recover")
+            self.assertEqual(attempt["recovery"]["classification"], "holding_resubmit_pending")
+            self.assertFalse(attempt["recovery"]["executable"])
+
+    def test_derive_recovery_holding_over_threshold_becomes_recovery_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            state, attempt = recovery_state_with_attempt(
+                tmp,
+                task_dir="crab_parent",
+                server_status="HOLDING on command RESUBMIT",
+                scheduler_status="FAILED",
+                job_states={"1": {"State": "failed"}},
+                failed_job_count=1,
+                hold_since="2026-04-21T00:00:00+00:00",
+            )
+            builder.derive_recovery_for_attempt(state, attempt, tmp / "recovery_cache", 48.0, "recover")
+            self.assertEqual(
+                attempt["recovery"]["classification"],
+                "holding_resubmit_recovery_candidate",
+            )
+            self.assertTrue(attempt["recovery"]["executable"])
+            self.assertTrue(attempt["recovery"]["kill_required"])
 
     def test_record_submission_appends_linear_family_child(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
