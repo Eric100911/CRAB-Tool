@@ -141,7 +141,10 @@ Key options:
 
 ### `status.sh`
 
-Collect cached machine-readable status snapshots, or call `crab status` directly.
+Collect cached machine-readable status snapshots, or call `crab status`
+directly. Cache-updating refreshes now skip tasks already cached as terminal
+(`server=KILLED`, or `scheduler=COMPLETED` with all jobs finished) unless you
+force a live refresh.
 
 ```bash
 ./status.sh [options] [-- crab status options]
@@ -151,6 +154,7 @@ Key options:
 
 - `--cached-status`
 - `--raw-status`
+- `--refresh-terminal-statuses`
 - `--manifest PATH`
 - `--cache-dir PATH`
 
@@ -172,6 +176,7 @@ Key options:
 - `--execute`
 - `--use-cached-status`
 - `--refresh-status`
+- `--refresh-terminal-statuses`
 - `--status-cache-dir PATH`
 
 ### `prepare_recovery_tasks.sh`
@@ -187,6 +192,7 @@ Key options:
 
 - `--use-cached-status`
 - `--refresh-status`
+- `--refresh-terminal-statuses`
 - `--status-cache-dir PATH`
 - `--recovery-cache-dir PATH`
 - `--stuck-hours HOURS`
@@ -256,6 +262,7 @@ Key options:
 - `--rebuild-plan`
 - `--use-cached-status`
 - `--refresh-status`
+- `--refresh-terminal-statuses`
 - `--allow-mixed-tasks`
 - `--skip-mixed-tasks`
 

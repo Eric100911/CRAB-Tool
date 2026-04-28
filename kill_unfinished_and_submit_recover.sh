@@ -10,6 +10,7 @@ CLI_DRY_RUN=""
 CLI_USE_CACHED_STATUS=""
 CLI_USE_PREPARED_PLAN=""
 CLI_ALLOW_MIXED_TASKS=""
+CLI_REFRESH_TERMINAL_STATUSES=""
 STATUS_CACHE_DIR="${STATUS_CACHE_DIR:-status_cache}"
 RECOVERY_CACHE_DIR="${RECOVERY_CACHE_DIR:-recovery_cache}"
 STATE_FILE="${STATUS_CACHE_DIR}/latest_state.json"
@@ -34,6 +35,8 @@ Options:
   --execute                 Execute the kill/report/render/submit sequence.
   --use-cached-status       Reuse the existing status snapshot if possible.
   --refresh-status          Force a fresh status collection before rebuilding the plan.
+  --refresh-terminal-statuses
+                            Force live refresh even for cached terminal tasks.
   --use-prepared-plan       Reuse the existing recovery metadata in latest_state.json if it exists.
   --rebuild-plan            Refresh recovery metadata before executing.
   --allow-mixed-tasks       Include mixed tasks in the execution set.
@@ -160,6 +163,10 @@ while (($#)); do
             CLI_USE_CACHED_STATUS=0
             shift
             ;;
+        --refresh-terminal-statuses)
+            CLI_REFRESH_TERMINAL_STATUSES=1
+            shift
+            ;;
         --use-prepared-plan)
             CLI_USE_PREPARED_PLAN=1
             shift
@@ -207,6 +214,9 @@ if [[ "${USE_PREPARED_PLAN}" != "1" || ! -f "${STATE_FILE}" ]]; then
         prepare_args+=(--use-cached-status)
     else
         prepare_args+=(--refresh-status)
+    fi
+    if [[ -n "${CLI_REFRESH_TERMINAL_STATUSES}" ]]; then
+        prepare_args+=(--refresh-terminal-statuses)
     fi
     ./prepare_recovery_tasks.sh "${prepare_args[@]}"
 fi

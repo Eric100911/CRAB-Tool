@@ -8,6 +8,7 @@ source "${SCRIPT_DIR}/crab_common.sh"
 MANIFEST="${CRAB_MANIFEST:-generated_crab_configs.txt}"
 CLI_DRY_RUN=""
 CLI_USE_CACHED_STATUS=""
+CLI_REFRESH_TERMINAL_STATUSES=""
 STATUS_CACHE_DIR="${STATUS_CACHE_DIR:-status_cache}"
 STATE_FILE="${STATUS_CACHE_DIR}/latest_state.json"
 SHOW_HELP=0
@@ -28,6 +29,8 @@ Options:
   --execute               Execute crab resubmit for each failed task.
   --use-cached-status     Reuse the existing status snapshot if it exists.
   --refresh-status        Force a fresh status collection before resubmitting.
+  --refresh-terminal-statuses
+                          Force live refresh even for cached terminal tasks.
   --                      Stop parsing wrapper options and pass the rest to crab resubmit.
 
 Environment fallback:
@@ -78,6 +81,10 @@ while (($#)); do
             CLI_USE_CACHED_STATUS=0
             shift
             ;;
+        --refresh-terminal-statuses)
+            CLI_REFRESH_TERMINAL_STATUSES=1
+            shift
+            ;;
         --)
             shift
             FORWARD_ARGS=("$@")
@@ -113,6 +120,10 @@ if [[ "${USE_CACHED_STATUS}" == "1" ]]; then
     RESUBMIT_ARGS+=(--use-cached-status)
 else
     RESUBMIT_ARGS+=(--refresh-status)
+fi
+
+if [[ -n "${CLI_REFRESH_TERMINAL_STATUSES}" ]]; then
+    RESUBMIT_ARGS+=(--refresh-terminal-statuses)
 fi
 
 if ((${#FORWARD_ARGS[@]} > 0)); then

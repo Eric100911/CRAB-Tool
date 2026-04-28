@@ -504,6 +504,237 @@ class CrabCliWrapperTest(unittest.TestCase):
             self.assertIn(f"status -d {child_task_dir} --json", crab_calls)
             self.assertNotIn(f"status -d {tmp / 'crab_sample_cfg'} --json", crab_calls)
 
+    def test_status_skips_cached_completed_finished_tasks_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            proxy_path, crab_log = make_fake_tools(tmp)
+            cfg_path = tmp / "sample_cfg.py"
+            cfg_path.write_text("# config\n")
+            manifest_path = tmp / "manifest.txt"
+            manifest_path.write_text(f"{cfg_path}\n")
+            state_path = tmp / "status_cache" / "latest_state.json"
+            state_path.parent.mkdir()
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "cwd": str(tmp),
+                        "families": {
+                            "crab_sample_cfg": {
+                                "root_task_dir": "crab_sample_cfg",
+                                "root_cfg": str(cfg_path),
+                                "attempt_order": ["crab_sample_cfg"],
+                                "latest_attempt_id": "crab_sample_cfg",
+                            }
+                        },
+                        "attempts": {
+                            "crab_sample_cfg": {
+                                "task_dir": "crab_sample_cfg",
+                                "task_path": str(tmp / "crab_sample_cfg"),
+                                "cfg": str(cfg_path),
+                                "cfg_path": str(cfg_path),
+                                "request_name": "sample_cfg",
+                                "family_id": "crab_sample_cfg",
+                                "generation": 0,
+                                "status": {
+                                    "status_collection_state": "ok_json",
+                                    "server_status": "SUBMITTED",
+                                    "scheduler_status": "COMPLETED",
+                                    "job_count": 3,
+                                    "job_states": {"finished": 3},
+                                    "failed_job_count": 0,
+                                    "failed_job_ids": [],
+                                },
+                                "recovery": {},
+                            }
+                        },
+                    }
+                )
+            )
+
+            env = self.base_env()
+            env.update(
+                {
+                    "PATH": f"{tmp / 'bin'}:{env['PATH']}",
+                    "X509_USER_PROXY": str(proxy_path),
+                    "FAKE_PROXY_PATH": str(proxy_path),
+                    "FAKE_CRAB_LOG": str(crab_log),
+                    "FAKE_CRAB_STATUS_OUTPUT": SAMPLE_STATUS_OUTPUT,
+                    "CMSSW_BASE": "/tmp/cmssw",
+                    "CMSSW_RELEASE_BASE": "/tmp/cmssw_release",
+                    "SCRAM_ARCH": "el9_amd64_gcc13",
+                }
+            )
+
+            completed = self.run_command(
+                [
+                    "bash",
+                    str(STATUS_SH),
+                    "--manifest",
+                    str(manifest_path),
+                    "--cache-dir",
+                    str(state_path.parent),
+                ],
+                env=env,
+            )
+            self.assertEqual(completed.returncode, 0, msg=completed.stderr)
+            self.assertIn("note=cached-terminal-skip", completed.stdout)
+            self.assertFalse(crab_log.exists())
+
+    def test_status_skips_cached_killed_tasks_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            proxy_path, crab_log = make_fake_tools(tmp)
+            cfg_path = tmp / "sample_cfg.py"
+            cfg_path.write_text("# config\n")
+            manifest_path = tmp / "manifest.txt"
+            manifest_path.write_text(f"{cfg_path}\n")
+            state_path = tmp / "status_cache" / "latest_state.json"
+            state_path.parent.mkdir()
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "cwd": str(tmp),
+                        "families": {
+                            "crab_sample_cfg": {
+                                "root_task_dir": "crab_sample_cfg",
+                                "root_cfg": str(cfg_path),
+                                "attempt_order": ["crab_sample_cfg"],
+                                "latest_attempt_id": "crab_sample_cfg",
+                            }
+                        },
+                        "attempts": {
+                            "crab_sample_cfg": {
+                                "task_dir": "crab_sample_cfg",
+                                "task_path": str(tmp / "crab_sample_cfg"),
+                                "cfg": str(cfg_path),
+                                "cfg_path": str(cfg_path),
+                                "request_name": "sample_cfg",
+                                "family_id": "crab_sample_cfg",
+                                "generation": 0,
+                                "status": {
+                                    "status_collection_state": "header_only_killed",
+                                    "server_status": "KILLED",
+                                    "scheduler_status": "FAILED (KILLED)",
+                                    "job_count": 0,
+                                    "job_states": {},
+                                    "failed_job_count": 0,
+                                    "failed_job_ids": [],
+                                },
+                                "recovery": {},
+                            }
+                        },
+                    }
+                )
+            )
+
+            env = self.base_env()
+            env.update(
+                {
+                    "PATH": f"{tmp / 'bin'}:{env['PATH']}",
+                    "X509_USER_PROXY": str(proxy_path),
+                    "FAKE_PROXY_PATH": str(proxy_path),
+                    "FAKE_CRAB_LOG": str(crab_log),
+                    "FAKE_CRAB_STATUS_OUTPUT": SAMPLE_STATUS_OUTPUT,
+                    "CMSSW_BASE": "/tmp/cmssw",
+                    "CMSSW_RELEASE_BASE": "/tmp/cmssw_release",
+                    "SCRAM_ARCH": "el9_amd64_gcc13",
+                }
+            )
+
+            completed = self.run_command(
+                [
+                    "bash",
+                    str(STATUS_SH),
+                    "--manifest",
+                    str(manifest_path),
+                    "--cache-dir",
+                    str(state_path.parent),
+                ],
+                env=env,
+            )
+            self.assertEqual(completed.returncode, 0, msg=completed.stderr)
+            self.assertIn("note=cached-terminal-skip", completed.stdout)
+            self.assertFalse(crab_log.exists())
+
+    def test_status_refresh_terminal_statuses_forces_live_query(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            proxy_path, crab_log = make_fake_tools(tmp)
+            cfg_path = tmp / "sample_cfg.py"
+            cfg_path.write_text("# config\n")
+            manifest_path = tmp / "manifest.txt"
+            manifest_path.write_text(f"{cfg_path}\n")
+            task_dir = tmp / "crab_sample_cfg"
+            task_dir.mkdir()
+            state_path = tmp / "status_cache" / "latest_state.json"
+            state_path.parent.mkdir()
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "cwd": str(tmp),
+                        "families": {
+                            "crab_sample_cfg": {
+                                "root_task_dir": "crab_sample_cfg",
+                                "root_cfg": str(cfg_path),
+                                "attempt_order": ["crab_sample_cfg"],
+                                "latest_attempt_id": "crab_sample_cfg",
+                            }
+                        },
+                        "attempts": {
+                            "crab_sample_cfg": {
+                                "task_dir": "crab_sample_cfg",
+                                "task_path": str(task_dir),
+                                "cfg": str(cfg_path),
+                                "cfg_path": str(cfg_path),
+                                "request_name": "sample_cfg",
+                                "family_id": "crab_sample_cfg",
+                                "generation": 0,
+                                "status": {
+                                    "status_collection_state": "ok_json",
+                                    "server_status": "SUBMITTED",
+                                    "scheduler_status": "COMPLETED",
+                                    "job_count": 3,
+                                    "job_states": {"finished": 3},
+                                    "failed_job_count": 0,
+                                    "failed_job_ids": [],
+                                },
+                                "recovery": {},
+                            }
+                        },
+                    }
+                )
+            )
+
+            env = self.base_env()
+            env.update(
+                {
+                    "PATH": f"{tmp / 'bin'}:{env['PATH']}",
+                    "X509_USER_PROXY": str(proxy_path),
+                    "FAKE_PROXY_PATH": str(proxy_path),
+                    "FAKE_CRAB_LOG": str(crab_log),
+                    "FAKE_CRAB_STATUS_OUTPUT": SAMPLE_STATUS_OUTPUT,
+                    "CMSSW_BASE": "/tmp/cmssw",
+                    "CMSSW_RELEASE_BASE": "/tmp/cmssw_release",
+                    "SCRAM_ARCH": "el9_amd64_gcc13",
+                }
+            )
+
+            completed = self.run_command(
+                [
+                    "bash",
+                    str(STATUS_SH),
+                    "--manifest",
+                    str(manifest_path),
+                    "--cache-dir",
+                    str(state_path.parent),
+                    "--refresh-terminal-statuses",
+                ],
+                env=env,
+            )
+            self.assertEqual(completed.returncode, 0, msg=completed.stderr)
+            self.assertTrue(crab_log.exists())
+            self.assertIn(f"status -d {task_dir} --json", crab_log.read_text())
+
     def test_python_help_keeps_status_available_but_recovery_builder_needs_cmsenv(self) -> None:
         env = self.base_env()
         status_help = self.run_command(

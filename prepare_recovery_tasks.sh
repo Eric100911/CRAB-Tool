@@ -7,6 +7,7 @@ source "${SCRIPT_DIR}/crab_common.sh"
 
 MANIFEST="${CRAB_MANIFEST:-generated_crab_configs.txt}"
 CLI_USE_CACHED_STATUS=""
+CLI_REFRESH_TERMINAL_STATUSES=""
 STATUS_CACHE_DIR="${STATUS_CACHE_DIR:-status_cache}"
 RECOVERY_CACHE_DIR="${RECOVERY_CACHE_DIR:-recovery_cache}"
 STATE_FILE="${STATUS_CACHE_DIR}/latest_state.json"
@@ -29,6 +30,8 @@ Options:
   --stuck-hours HOURS     Minimum idle/cooloff age required for recovery planning.
   --use-cached-status     Reuse the existing status snapshot if it exists.
   --refresh-status        Force a fresh status collection before planning recovery.
+  --refresh-terminal-statuses
+                          Force live refresh even for cached terminal tasks.
 
 Environment fallback:
   CRAB_MANIFEST           Default manifest path.
@@ -85,6 +88,10 @@ while (($#)); do
             CLI_USE_CACHED_STATUS=0
             shift
             ;;
+        --refresh-terminal-statuses)
+            CLI_REFRESH_TERMINAL_STATUSES=1
+            shift
+            ;;
         *)
             die "Unknown option for ./prepare_recovery_tasks.sh: $1"
             ;;
@@ -104,7 +111,14 @@ require_manifest "${MANIFEST}"
 require_proxy_env
 
 if [[ "${USE_CACHED_STATUS}" != "1" || ! -f "${STATE_FILE}" ]]; then
-    ./status.sh --manifest "${MANIFEST}" --cache-dir "${STATUS_CACHE_DIR}"
+    status_args=(
+        --manifest "${MANIFEST}"
+        --cache-dir "${STATUS_CACHE_DIR}"
+    )
+    if [[ -n "${CLI_REFRESH_TERMINAL_STATUSES}" ]]; then
+        status_args+=(--refresh-terminal-statuses)
+    fi
+    ./status.sh "${status_args[@]}"
 fi
 
 python3 crab_recovery_task_builder.py refresh-recovery \
