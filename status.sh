@@ -9,6 +9,7 @@ MANIFEST="${CRAB_MANIFEST:-generated_crab_configs.txt}"
 STATUS_CACHE_DIR="${STATUS_CACHE_DIR:-status_cache}"
 STATE_FILE="${STATUS_CACHE_DIR}/latest_state.json"
 CLI_RAW_STATUS=""
+CLI_REFRESH_TERMINAL_STATUSES=""
 CHAIN_SCOPE="latest"
 SHOW_HELP=0
 declare -a FORWARD_ARGS=()
@@ -33,6 +34,8 @@ Options:
   --all-chain-attempts  Query every tracked attempt in each recovery chain.
   --latest-chain-attempts
                         Query only the latest attempt in each recovery chain.
+  --refresh-terminal-statuses
+                        Force live refresh even for cached terminal tasks.
   --                    Stop parsing wrapper options and pass the rest through.
 
 Environment fallback:
@@ -89,6 +92,10 @@ while (($#)); do
             CHAIN_SCOPE="latest"
             shift
             ;;
+        --refresh-terminal-statuses)
+            CLI_REFRESH_TERMINAL_STATUSES=1
+            shift
+            ;;
         --)
             shift
             FORWARD_ARGS=("$@")
@@ -121,6 +128,10 @@ declare -a SNAPSHOT_ARGS=(
 
 if [[ "${RAW_STATUS}" == "1" ]]; then
     SNAPSHOT_ARGS+=(--no-update-cache --raw-output)
+fi
+
+if [[ -n "${CLI_REFRESH_TERMINAL_STATUSES}" ]]; then
+    SNAPSHOT_ARGS+=(--refresh-terminal-statuses)
 fi
 
 if ((${#FORWARD_ARGS[@]} > 0)); then

@@ -104,6 +104,17 @@ def add_state_reader_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_terminal_refresh_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--refresh-terminal-statuses",
+        action="store_true",
+        help=(
+            "Force live status refresh even when cached status is already terminal "
+            "(killed or completed with all jobs finished)."
+        ),
+    )
+
+
 def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[str]]:
     parser = argparse.ArgumentParser(
         description="Collect, query, display, and summarize CRAB status snapshots.",
@@ -138,6 +149,7 @@ def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[
     )
     add_manifest_arg(collect_parser)
     add_cache_locator_args(collect_parser)
+    add_terminal_refresh_arg(collect_parser)
 
     query_all_parser = subparsers.add_parser(
         "query-all",
@@ -150,6 +162,7 @@ def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[
     )
     add_manifest_arg(query_all_parser)
     add_cache_locator_args(query_all_parser)
+    add_terminal_refresh_arg(query_all_parser)
     query_all_parser.add_argument(
         "--no-update-cache",
         action="store_true",
@@ -172,6 +185,7 @@ def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[
     )
     add_manifest_arg(query_latest_parser)
     add_cache_locator_args(query_latest_parser)
+    add_terminal_refresh_arg(query_latest_parser)
     query_latest_parser.add_argument(
         "--no-update-cache",
         action="store_true",
@@ -366,6 +380,7 @@ def format_task_summary(summary: dict[str, Any]) -> str:
         f"scheduler={summary['scheduler_status'] or 'unknown'} "
         f"failed={summary['failed_job_count']} "
         f"{states}"
+        f"{' ' + summary['summary_note'] if summary.get('summary_note') else ''}"
     ).strip()
 
 
@@ -399,6 +414,45 @@ def is_resubmit_eligible_status(status: dict[str, Any]) -> bool:
     return not is_killed_server_status(server_status) and not is_holding_resubmit_server_status(
         server_status
     )
+
+
+def is_cached_completed_and_all_finished(status: dict[str, Any]) -> bool:
+    if str(status.get("status_collection_state") or "").strip() != STATUS_COLLECTION_OK:
+        return False
+
+    scheduler_status = str(status.get("scheduler_status") or "").strip().upper()
+    if scheduler_status != "COMPLETED":
+        return False
+
+    job_states = dict(status.get("job_states") or {})
+    total_jobs = int(status.get("job_count") or sum(int(value) for value in job_states.values()))
+    finished_jobs = int(job_states.get("finished", 0))
+    if total_jobs <= 0 or finished_jobs != total_jobs:
+        return False
+
+    if int(status.get("failed_job_count", 0)) != 0:
+        return False
+
+    return all(
+        int(count) == 0 for state, count in job_states.items() if str(state) != "finished"
+    )
+
+
+def is_cached_killed(status: dict[str, Any]) -> bool:
+    if not is_killed_server_status(status.get("server_status")):
+        return False
+    return str(status.get("status_collection_state") or "").strip() in {
+        STATUS_COLLECTION_OK,
+        STATUS_COLLECTION_HEADER_ONLY_KILLED,
+    }
+
+
+def should_skip_live_refresh(
+    status: dict[str, Any], *, force_terminal_refresh: bool
+) -> bool:
+    if force_terminal_refresh:
+        return False
+    return is_cached_completed_and_all_finished(status) or is_cached_killed(status)
 
 
 def hash_payload(payload: dict[str, Any]) -> str:
@@ -526,8 +580,10 @@ def merge_attempt_status(
     existing_status = dict(existing_attempt.get("status", {}))
     if is_holding_resubmit_server_status(status.get("server_status")):
         if is_holding_resubmit_server_status(existing_status.get("server_status")):
-            status["hold_since"] = existing_status.get("hold_since") or status.get(
-                "collected_at"
+            status["hold_since"] = (
+                existing_status.get("hold_since")
+                or existing_status.get("collected_at")
+                or status.get("collected_at")
             )
         else:
             status["hold_since"] = status.get("collected_at")
@@ -589,6 +645,43 @@ def latest_query_failures(state: dict[str, Any]) -> list[str]:
     return sorted(task_dir for task_dir in state.get("query_failures", []) if task_dir in latest_ids)
 
 
+def make_cached_task_summary(attempt: dict[str, Any], summary_note: str) -> dict[str, Any]:
+    status = dict(attempt.get("status", {}))
+    task_path = str(attempt.get("task_path") or attempt.get("task_dir") or "")
+    return {
+        "cfg": str(attempt.get("cfg_path") or attempt.get("cfg") or ""),
+        "task_dir": str(attempt.get("task_dir") or Path(task_path).name),
+        "task_path": task_path,
+        "task_name": status.get("task_name"),
+        "server_status": status.get("server_status"),
+        "scheduler_status": status.get("scheduler_status"),
+        "dashboard_url": status.get("dashboard_url"),
+        "job_count": int(status.get("job_count", 0)),
+        "job_states": dict(status.get("job_states", {})),
+        "failed_job_count": int(status.get("failed_job_count", 0)),
+        "failed_job_ids": [str(job_id) for job_id in status.get("failed_job_ids", [])],
+        "status_collection_state": status.get(
+            "status_collection_state", STATUS_COLLECTION_NOT_COLLECTED
+        ),
+        "query_error": status.get("query_error"),
+        "query_warning": status.get("query_warning"),
+        "summary_note": summary_note,
+    }
+
+
+def current_query_metadata(state: dict[str, Any]) -> tuple[list[str], list[str]]:
+    query_failures: list[str] = []
+    header_only_killed_tasks: list[str] = []
+    for attempt_id, attempt in state.get("attempts", {}).items():
+        status = dict(attempt.get("status", {}))
+        status_state = str(status.get("status_collection_state") or "")
+        if status_state == STATUS_COLLECTION_FATAL_ERROR:
+            query_failures.append(str(attempt_id))
+        if status_state == STATUS_COLLECTION_HEADER_ONLY_KILLED:
+            header_only_killed_tasks.append(str(attempt_id))
+    return sorted(query_failures), sorted(header_only_killed_tasks)
+
+
 def query_entries(
     manifest_entries: list[str], task_root: Path, state: dict[str, Any]
 ) -> list[tuple[str, Path]]:
@@ -640,10 +733,8 @@ def run_raw_queries(entries: list[tuple[str, Path]], extra_args: list[str]) -> i
 
 def record_query_metadata(
     state: dict[str, Any],
-    *,
-    query_failures: list[str],
-    header_only_killed_tasks: list[str],
 ) -> None:
+    query_failures, header_only_killed_tasks = current_query_metadata(state)
     state["query_failures"] = sorted(query_failures)
     state["header_only_killed_tasks"] = sorted(header_only_killed_tasks)
     state["task_count"] = len(state["attempts"])
@@ -662,13 +753,27 @@ def run_collect(args: argparse.Namespace, extra_args: list[str]) -> int:
     state["status_args"] = list(extra_args)
 
     query_failures: list[str] = []
-    header_only_killed_tasks: list[str] = []
     family_structure_changed = bool(state.get("attempts")) and not state.get("families")
 
     for cfg, task_dir in query_entries(read_manifest(manifest_path), task_root, state):
+        task_dir_name = task_dir.name
+        existing_attempt = state["attempts"].get(task_dir_name)
+        existing_status = dict((existing_attempt or {}).get("status", {}))
+        if existing_attempt and should_skip_live_refresh(
+            existing_status,
+            force_terminal_refresh=bool(args.refresh_terminal_statuses),
+        ):
+            print(
+                format_task_summary(
+                    make_cached_task_summary(
+                        existing_attempt, "note=cached-terminal-skip"
+                    )
+                )
+            )
+            continue
+
         summary, payload, _stdout, _stderr, _cmd = build_task_summary(cfg, task_dir, extra_args)
         status = make_status_payload(summary, payload)
-        task_dir_name = task_dir.name
         if task_dir_name not in state["attempts"]:
             family_structure_changed = True
         state["attempts"][task_dir_name] = merge_attempt_status(
@@ -678,19 +783,13 @@ def run_collect(args: argparse.Namespace, extra_args: list[str]) -> int:
             status,
         )
 
-        if status["status_collection_state"] == STATUS_COLLECTION_HEADER_ONLY_KILLED:
-            header_only_killed_tasks.append(task_dir_name)
         if status["status_collection_state"] == STATUS_COLLECTION_FATAL_ERROR:
             query_failures.append(task_dir_name)
         print(format_task_summary(summary))
 
     if family_structure_changed:
         rebuild_families(state)
-    record_query_metadata(
-        state,
-        query_failures=query_failures,
-        header_only_killed_tasks=header_only_killed_tasks,
-    )
+    record_query_metadata(state)
     write_json(state_path, state)
     return 1 if query_failures else 0
 
@@ -736,14 +835,26 @@ def run_query_latest(args: argparse.Namespace, extra_args: list[str]) -> int:
 
     ensure_compatible_status_args(extra_args)
     query_failures: list[str] = []
-    header_only_killed_tasks: list[str] = []
     family_structure_changed = False
 
     for cfg, task_dir in entries:
-        summary, payload, _stdout, _stderr, _cmd = build_task_summary(cfg, task_dir, extra_args)
         task_dir_name = task_dir.name
-        if summary["status_collection_state"] == STATUS_COLLECTION_HEADER_ONLY_KILLED:
-            header_only_killed_tasks.append(task_dir_name)
+        existing_attempt = state["attempts"].get(task_dir_name)
+        existing_status = dict((existing_attempt or {}).get("status", {}))
+        if (not args.no_update_cache) and existing_attempt and should_skip_live_refresh(
+            existing_status,
+            force_terminal_refresh=bool(args.refresh_terminal_statuses),
+        ):
+            print(
+                format_task_summary(
+                    make_cached_task_summary(
+                        existing_attempt, "note=cached-terminal-skip"
+                    )
+                )
+            )
+            continue
+
+        summary, payload, _stdout, _stderr, _cmd = build_task_summary(cfg, task_dir, extra_args)
         if summary["status_collection_state"] == STATUS_COLLECTION_FATAL_ERROR:
             query_failures.append(task_dir_name)
         print(format_task_summary(summary))
@@ -769,11 +880,7 @@ def run_query_latest(args: argparse.Namespace, extra_args: list[str]) -> int:
     state["status_args"] = list(extra_args)
     if family_structure_changed:
         rebuild_families(state)
-    record_query_metadata(
-        state,
-        query_failures=query_failures,
-        header_only_killed_tasks=header_only_killed_tasks,
-    )
+    record_query_metadata(state)
     write_json(state_path, state)
     return 1 if query_failures else 0
 

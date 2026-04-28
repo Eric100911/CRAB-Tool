@@ -63,6 +63,11 @@ def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[
         action="store_true",
         help="Refresh latest_state.json before resubmitting.",
     )
+    parser.add_argument(
+        "--refresh-terminal-statuses",
+        action="store_true",
+        help="Force live refresh even for cached terminal tasks.",
+    )
     return parser.parse_known_args(argv)
 
 
@@ -89,6 +94,7 @@ def refresh_latest_status(args: argparse.Namespace) -> int:
         state_file=str(resolve_state_file(args)),
         no_update_cache=False,
         raw_output=False,
+        refresh_terminal_statuses=bool(args.refresh_terminal_statuses),
     )
     return snapshot.run_query_latest(status_args, [])
 
