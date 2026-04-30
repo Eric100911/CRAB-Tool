@@ -279,6 +279,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         formatter_class=HelpFormatter,
     )
     add_state_file_argument(render_all_parser)
+    render_all_parser.add_argument(
+        "--skip-unresolved-lumi",
+        action="store_true",
+        help=(
+            "Skip tasks whose recovery lumi mask still requires a later crab report "
+            "instead of failing the whole render pass."
+        ),
+    )
 
     list_parser = subparsers.add_parser(
         "list-executable",
@@ -1330,11 +1338,27 @@ def render_all(args: argparse.Namespace) -> int:
     state = load_state(state_path)
     ensure_recovery_current(state)
     rendered_paths: list[str] = []
+    skipped_unresolved: list[str] = []
     template_path = Path(__file__).with_name("crab3_recovery_template.py")
 
     for attempt in state["attempts"].values():
         if not attempt.get("recovery", {}).get("executable", False):
             continue
+        if attempt.get("recovery", {}).get("resolved_lumi_mask") is None:
+            resolve_action, resolve_source, _ = resolve_lumi_for_attempt(attempt)
+            if resolve_action == "skip":
+                continue
+            if resolve_action != "submit":
+                if (
+                    getattr(args, "skip_unresolved_lumi", False)
+                    and resolve_source == "missing_not_finished_lumis"
+                ):
+                    skipped_unresolved.append(str(attempt["task_dir"]))
+                    continue
+                raise RuntimeError(
+                    f"Task {attempt['task_dir']} cannot be rendered yet; "
+                    f"lumi resolution returned {resolve_action}:{resolve_source}."
+                )
         rendered_paths.append(str(render_recovery_config(attempt, template_path)))
 
     output_dir = Path("recovery_cache").resolve()
@@ -1349,6 +1373,11 @@ def render_all(args: argparse.Namespace) -> int:
         "\n".join(rendered_paths) + ("\n" if rendered_paths else "")
     )
     print(f"Rendered {len(rendered_paths)} recovery config(s)")
+    if skipped_unresolved:
+        print(
+            "Skipped unresolved-lumi task(s): "
+            + ", ".join(sorted(skipped_unresolved))
+        )
     print(manifest_path)
     return 0
 

@@ -387,7 +387,7 @@ class CrabRecoveryStateBuilderTest(unittest.TestCase):
             self.assertEqual(
                 child["config_metadata"],
                 {
-                    "units_per_job": 100,
+                    "units_per_job": 80,
                     "publication_enabled": False,
                     "output_dataset_tag": "parent__recover1",
                 },
@@ -433,7 +433,7 @@ class CrabRecoveryStateBuilderTest(unittest.TestCase):
             self.assertEqual(
                 json.loads(expected_lumi_mask_path.read_text()), ROOT_COMPACT_MASK
             )
-            self.assertEqual(parsed.get_field("Data", "unitsPerJob"), 100)
+            self.assertEqual(parsed.get_field("Data", "unitsPerJob"), 80)
             self.assertEqual(parsed.get_field("Data", "splitting"), "LumiBased")
             self.assertEqual(parsed.get_field("Data", "outputDatasetTag"), "parent__recover1")
             self.assertEqual(parsed.get_field("Data", "publication"), False)
@@ -455,7 +455,7 @@ class CrabRecoveryStateBuilderTest(unittest.TestCase):
                 metadata,
                 {
                     "request_name": "parent__recover1",
-                    "units_per_job": 100,
+                    "units_per_job": 80,
                     "publication_enabled": False,
                     "output_dataset_tag": "parent__recover1",
                     "lumi_mask": str(expected_lumi_mask_path),
@@ -530,6 +530,261 @@ class CrabRecoveryStateBuilderTest(unittest.TestCase):
                 }
             )
             self.assertEqual((action, source, path), ("skip", "complete", ""))
+
+    def test_render_all_strict_fails_when_normal_task_still_needs_report(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            cfg_path = tmp / "parent.py"
+            original_lumi_mask = tmp / "original_lumi_mask.json"
+            original_lumi_mask.write_text(json.dumps(ROOT_COMPACT_MASK) + "\n")
+            write_original_cfg(cfg_path, lumi_mask=str(original_lumi_mask))
+
+            state_path = tmp / builder.STATE_NAME
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "cwd": str(tmp),
+                        "families": {
+                            "crab_parent": {
+                                "root_task_dir": "crab_parent",
+                                "root_cfg": str(cfg_path),
+                                "attempt_order": ["crab_parent"],
+                                "latest_attempt_id": "crab_parent",
+                            }
+                        },
+                        "attempts": {
+                            "crab_parent": {
+                                "task_dir": "crab_parent",
+                                "cfg": str(cfg_path),
+                                "cfg_path": str(cfg_path),
+                                "task_path": str(tmp / "crab_parent"),
+                                "request_name": "parent",
+                                "family_id": "crab_parent",
+                                "generation": 0,
+                                "planned_lumi_mask": ROOT_COMPACT_MASK,
+                                "planned_lumi_source": "original_task_lumi_mask",
+                                "original_lumi_mask": ROOT_COMPACT_MASK,
+                                "config_metadata": {
+                                    "units_per_job": 40,
+                                    "publication_enabled": False,
+                                    "output_dataset_tag": "sample",
+                                },
+                                "status_revision": "sha256:test",
+                                "status": {
+                                    "status_collection_state": "ok_json",
+                                    "server_status": "SUBMITTED",
+                                    "scheduler_status": "SUBMITTED",
+                                    "job_states": {"finished": 1277, "idle": 511},
+                                    "failed_job_count": 0,
+                                    "failed_job_ids": [],
+                                    "jobs": {},
+                                },
+                                "recovery": {
+                                    "derived_from_revision": "sha256:test",
+                                    "classification": "recovery_candidate",
+                                    "executable": True,
+                                },
+                                "artifacts": {
+                                    "preserved_not_finished_lumis": str(
+                                        tmp / "report" / "notFinishedLumis.json"
+                                    ),
+                                    "task_not_finished_lumis": str(
+                                        tmp / "crab_parent" / "results" / "notFinishedLumis.json"
+                                    ),
+                                    "task_processed_lumis": str(
+                                        tmp / "crab_parent" / "results" / "processedLumis.json"
+                                    ),
+                                    "task_lumis_to_process": str(
+                                        tmp / "crab_parent" / "results" / "lumisToProcess.json"
+                                    ),
+                                    "next_recover_cfg": str(
+                                        tmp / "recovery_cache" / "configs" / "parent__recover1.py"
+                                    ),
+                                    "next_recover_request_name": "parent__recover1",
+                                    "next_planned_lumi_mask_file": str(
+                                        tmp / "recovery_cache" / "lumimasks" / "parent__recover1.json"
+                                    ),
+                                },
+                            }
+                        },
+                    }
+                )
+            )
+
+            args = type(
+                "Args",
+                (),
+                {
+                    "state_file": str(state_path),
+                    "plan_file": None,
+                    "summary_file": None,
+                    "skip_unresolved_lumi": False,
+                },
+            )
+            with self.assertRaisesRegex(RuntimeError, "missing_not_finished_lumis"):
+                builder.render_all(args)
+
+    def test_render_all_skip_unresolved_lumi_renders_ready_tasks_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            parent_cfg = tmp / "parent.py"
+            killed_cfg = tmp / "killed.py"
+            original_lumi_mask = tmp / "original_lumi_mask.json"
+            original_lumi_mask.write_text(json.dumps(ROOT_COMPACT_MASK) + "\n")
+            write_original_cfg(parent_cfg, lumi_mask=str(original_lumi_mask))
+            write_original_cfg(killed_cfg, lumi_mask=str(original_lumi_mask))
+
+            state_path = tmp / builder.STATE_NAME
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "cwd": str(tmp),
+                        "families": {
+                            "crab_parent": {
+                                "root_task_dir": "crab_parent",
+                                "root_cfg": str(parent_cfg),
+                                "attempt_order": ["crab_parent"],
+                                "latest_attempt_id": "crab_parent",
+                            },
+                            "crab_killed": {
+                                "root_task_dir": "crab_killed",
+                                "root_cfg": str(killed_cfg),
+                                "attempt_order": ["crab_killed"],
+                                "latest_attempt_id": "crab_killed",
+                            },
+                        },
+                        "attempts": {
+                            "crab_parent": {
+                                "task_dir": "crab_parent",
+                                "cfg": str(parent_cfg),
+                                "cfg_path": str(parent_cfg),
+                                "task_path": str(tmp / "crab_parent"),
+                                "request_name": "parent",
+                                "family_id": "crab_parent",
+                                "generation": 0,
+                                "planned_lumi_mask": ROOT_COMPACT_MASK,
+                                "planned_lumi_source": "original_task_lumi_mask",
+                                "original_lumi_mask": ROOT_COMPACT_MASK,
+                                "config_metadata": {
+                                    "units_per_job": 40,
+                                    "publication_enabled": False,
+                                    "output_dataset_tag": "sample",
+                                },
+                                "status_revision": "sha256:parent",
+                                "status": {
+                                    "status_collection_state": "ok_json",
+                                    "server_status": "SUBMITTED",
+                                    "scheduler_status": "SUBMITTED",
+                                    "job_states": {"finished": 1277, "idle": 511},
+                                    "failed_job_count": 0,
+                                    "failed_job_ids": [],
+                                    "jobs": {},
+                                },
+                                "recovery": {
+                                    "derived_from_revision": "sha256:parent",
+                                    "classification": "recovery_candidate",
+                                    "executable": True,
+                                },
+                                "artifacts": {
+                                    "preserved_not_finished_lumis": str(
+                                        tmp / "report" / "notFinishedLumis.json"
+                                    ),
+                                    "task_not_finished_lumis": str(
+                                        tmp / "crab_parent" / "results" / "notFinishedLumis.json"
+                                    ),
+                                    "task_processed_lumis": str(
+                                        tmp / "crab_parent" / "results" / "processedLumis.json"
+                                    ),
+                                    "task_lumis_to_process": str(
+                                        tmp / "crab_parent" / "results" / "lumisToProcess.json"
+                                    ),
+                                    "next_recover_cfg": str(
+                                        tmp / "recovery_cache" / "configs" / "parent__recover1.py"
+                                    ),
+                                    "next_recover_request_name": "parent__recover1",
+                                    "next_planned_lumi_mask_file": str(
+                                        tmp / "recovery_cache" / "lumimasks" / "parent__recover1.json"
+                                    ),
+                                },
+                            },
+                            "crab_killed": {
+                                "task_dir": "crab_killed",
+                                "cfg": str(killed_cfg),
+                                "cfg_path": str(killed_cfg),
+                                "task_path": str(tmp / "crab_killed"),
+                                "request_name": "killed",
+                                "family_id": "crab_killed",
+                                "generation": 0,
+                                "planned_lumi_mask": ROOT_COMPACT_MASK,
+                                "planned_lumi_source": "original_task_lumi_mask",
+                                "original_lumi_mask": ROOT_COMPACT_MASK,
+                                "config_metadata": {
+                                    "units_per_job": 40,
+                                    "publication_enabled": False,
+                                    "output_dataset_tag": "sample",
+                                },
+                                "status_revision": "sha256:killed",
+                                "status": {
+                                    "status_collection_state": "ok_json",
+                                    "server_status": "KILLED",
+                                    "scheduler_status": "FAILED (KILLED)",
+                                    "job_states": {"failed": 3},
+                                    "failed_job_count": 3,
+                                    "failed_job_ids": ["1", "2", "3"],
+                                    "jobs": {},
+                                },
+                                "recovery": {
+                                    "derived_from_revision": "sha256:killed",
+                                    "classification": "killed_recovery_candidate",
+                                    "executable": True,
+                                },
+                                "artifacts": {
+                                    "preserved_not_finished_lumis": str(
+                                        tmp / "report_killed" / "notFinishedLumis.json"
+                                    ),
+                                    "task_not_finished_lumis": str(
+                                        tmp / "crab_killed" / "results" / "notFinishedLumis.json"
+                                    ),
+                                    "task_processed_lumis": str(
+                                        tmp / "crab_killed" / "results" / "processedLumis.json"
+                                    ),
+                                    "task_lumis_to_process": str(
+                                        tmp / "crab_killed" / "results" / "lumisToProcess.json"
+                                    ),
+                                    "next_recover_cfg": str(
+                                        tmp / "recovery_cache" / "configs" / "killed__recover1.py"
+                                    ),
+                                    "next_recover_request_name": "killed__recover1",
+                                    "next_planned_lumi_mask_file": str(
+                                        tmp / "recovery_cache" / "lumimasks" / "killed__recover1.json"
+                                    ),
+                                },
+                            },
+                        },
+                    }
+                )
+            )
+
+            args = type(
+                "Args",
+                (),
+                {
+                    "state_file": str(state_path),
+                    "plan_file": None,
+                    "summary_file": None,
+                    "skip_unresolved_lumi": True,
+                },
+            )
+            self.assertEqual(builder.render_all(args), 0)
+            manifest_path = tmp / "recovery_cache" / builder.CONFIG_MANIFEST_NAME
+            self.assertTrue(manifest_path.is_file())
+            manifest_lines = [
+                line for line in manifest_path.read_text().splitlines() if line.strip()
+            ]
+            self.assertEqual(len(manifest_lines), 1)
+            self.assertIn("killed__recover1.py", manifest_lines[0])
+            self.assertFalse((tmp / "recovery_cache" / "configs" / "parent__recover1.py").exists())
+            self.assertTrue((tmp / "recovery_cache" / "configs" / "killed__recover1.py").exists())
 
     def test_add_to_chain_registers_existing_child_after_exact_lumi_validation(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -776,15 +1031,15 @@ class CrabRecoveryStateBuilderTest(unittest.TestCase):
                     "]",
                 )
                 .replace(
-                    "config.JobType.numCores = __DEFAULT_RECOVERY_NUM_CORES__",
+                    "config.JobType.numCores = 1",
                     "config.JobType.numCores = 8",
                 )
                 .replace(
-                    "config.JobType.maxMemoryMB = __DEFAULT_RECOVERY_MAX_MEMORY_MB__",
+                    "config.JobType.maxMemoryMB = 2000",
                     "config.JobType.maxMemoryMB = 8000",
                 )
                 .replace(
-                    "config.Data.unitsPerJob = __DEFAULT_RECOVERY_UNITS_PER_JOB__",
+                    "config.Data.unitsPerJob = 80",
                     "config.Data.unitsPerJob = 10",
                 )
                 .replace(

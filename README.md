@@ -217,6 +217,9 @@ Recovery overrides:
   `./crab_recovery_task_builder.py render-all ...` after editing the template so
   the generated recovery configs under `recovery_cache/configs/` pick up the
   new direct config values.
+- `prepare_recovery_tasks.sh` now calls `render-all --skip-unresolved-lumi`, so
+  normal unfinished tasks that still need a later `crab report` are kept in the
+  executable recovery set without aborting the plan refresh.
 - The builder preserves literal `config.<Section>.<field>` assignments from the
   original task config and applies the literal assignments from
   `crab3_recovery_template.py` on top, so fields not restated in the recovery
@@ -227,6 +230,10 @@ Recovery overrides:
   `results/notFinishedLumis.json` into `recovery_cache/reports/<task>/` before
   the original task is killed. The rendered recovery config then uses that
   preserved coverage written back out as a generated lumi-mask JSON file.
+- Because of that ordering, `recovery_cache/generated_recovery_configs.txt` can
+  be a partial manifest after plan preparation. Tasks whose missing lumi
+  coverage is not yet locally known are rendered later by the execution wrapper
+  after `resolve-lumi-mask` succeeds.
 - The execution wrapper re-checks the live CRAB server status before deciding
   whether a task should follow the normal `report -> kill` path or the
   already-killed fallback path, even when `--use-cached-status` and

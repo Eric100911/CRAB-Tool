@@ -127,4 +127,5 @@ python3 crab_recovery_task_builder.py refresh-recovery \
     --stuck-hours "${STUCK_HOURS}"
 
 python3 crab_recovery_task_builder.py render-all \
-    --state-file "${STATE_FILE}"
+    --state-file "${STATE_FILE}" \
+    --skip-unresolved-lumi

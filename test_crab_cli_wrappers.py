@@ -152,6 +152,15 @@ def make_recovery_state(
     write_original_cfg(cfg_path, original_lumi_mask)
     task_path = tmp / "crab_sample_cfg"
     task_path.mkdir()
+    jobs: dict[str, dict[str, object]] = {}
+    next_job_id = 1
+    for state_name, count in job_states.items():
+        for _ in range(count):
+            job = {"State": state_name}
+            if state_name in {"idle", "cooloff", "running", "transferring"}:
+                job["SubmitTimes"] = [1]
+            jobs[str(next_job_id)] = job
+            next_job_id += 1
     report_dir = recovery_cache_dir / "reports" / "crab_sample_cfg"
     recover_cfg = recovery_cache_dir / "configs" / "sample_cfg__recover1.py"
     state_path = status_cache_dir / "latest_state.json"
@@ -191,7 +200,7 @@ def make_recovery_state(
                             "job_states": job_states,
                             "failed_job_count": 0,
                             "failed_job_ids": [],
-                            "jobs": {},
+                            "jobs": jobs,
                         },
                         "recovery": {
                             "classification": classification,
@@ -268,6 +277,59 @@ class CrabCliWrapperTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 0)
         self.assertIn("Usage: ./prepare_recovery_tasks.sh", completed.stdout)
         self.assertNotIn("CMSSW environment is not active", completed.stderr)
+
+    def test_prepare_recovery_use_cached_status_skips_unresolved_lumi_render(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            proxy_path, crab_log = make_fake_tools(tmp)
+            manifest_path = tmp / "manifest.txt"
+            recovery_cache_dir = tmp / "recovery_cache"
+            recovery_cache_dir.mkdir()
+            status_cache_dir = tmp / "status_cache"
+            cfg_path, _task_path, _state_path = make_recovery_state(
+                tmp,
+                status_cache_dir,
+                recovery_cache_dir,
+                classification="recovery_candidate",
+                job_states={"finished": 1277, "idle": 511},
+            )
+            manifest_path.write_text(f"{cfg_path}\n")
+
+            env = self.base_env()
+            env.update(
+                {
+                    "PATH": f"{tmp / 'bin'}:{env['PATH']}",
+                    "PYTHONPATH": f"{tmp}:{env.get('PYTHONPATH', '')}",
+                    "X509_USER_PROXY": str(proxy_path),
+                    "FAKE_PROXY_PATH": str(proxy_path),
+                    "FAKE_CRAB_LOG": str(crab_log),
+                    "CMSSW_BASE": "/tmp/cmssw",
+                    "CMSSW_RELEASE_BASE": "/tmp/cmssw_release",
+                    "SCRAM_ARCH": "el9_amd64_gcc13",
+                }
+            )
+
+            completed = self.run_command(
+                [
+                    "bash",
+                    str(PREPARE_RECOVERY_SH),
+                    "--use-cached-status",
+                    "--manifest",
+                    str(manifest_path),
+                    "--status-cache-dir",
+                    str(status_cache_dir),
+                    "--recovery-cache-dir",
+                    str(recovery_cache_dir),
+                ],
+                env=env,
+            )
+            self.assertEqual(completed.returncode, 0, msg=completed.stderr)
+            self.assertIn("Refreshed recovery metadata", completed.stdout)
+            self.assertIn("Skipped unresolved-lumi task(s): crab_sample_cfg", completed.stdout)
+            manifest_lines = (
+                recovery_cache_dir / "generated_recovery_configs.txt"
+            ).read_text().splitlines()
+            self.assertEqual([line for line in manifest_lines if line.strip()], [])
 
     def test_submit_requires_cmssw_before_normal_execution(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -945,6 +1007,59 @@ class CrabCliWrapperTest(unittest.TestCase):
             self.assertIn("crab report -d", lines[0])
             self.assertIn("preserve-if-present", completed.stdout)
             self.assertNotIn("crab kill -d", completed.stdout)
+
+    def test_kill_recover_rebuild_plan_dry_run_survives_unresolved_lumi_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            proxy_path, crab_log = make_fake_tools(tmp)
+            manifest_path = tmp / "manifest.txt"
+            recovery_cache_dir = tmp / "recovery_cache"
+            recovery_cache_dir.mkdir()
+            status_cache_dir = tmp / "status_cache"
+            cfg_path, task_path, _state_path = make_recovery_state(
+                tmp,
+                status_cache_dir,
+                recovery_cache_dir,
+                classification="recovery_candidate",
+                job_states={"finished": 1277, "idle": 511},
+            )
+            manifest_path.write_text(f"{cfg_path}\n")
+
+            env = self.base_env()
+            env.update(
+                {
+                    "PATH": f"{tmp / 'bin'}:{env['PATH']}",
+                    "PYTHONPATH": f"{tmp}:{env.get('PYTHONPATH', '')}",
+                    "X509_USER_PROXY": str(proxy_path),
+                    "FAKE_PROXY_PATH": str(proxy_path),
+                    "FAKE_CRAB_LOG": str(crab_log),
+                    "CMSSW_BASE": "/tmp/cmssw",
+                    "CMSSW_RELEASE_BASE": "/tmp/cmssw_release",
+                    "SCRAM_ARCH": "el9_amd64_gcc13",
+                }
+            )
+
+            completed = self.run_command(
+                [
+                    "bash",
+                    str(KILL_RECOVER_SH),
+                    "--rebuild-plan",
+                    "--dry-run",
+                    "--use-cached-status",
+                    "--manifest",
+                    str(manifest_path),
+                    "--status-cache-dir",
+                    str(status_cache_dir),
+                    "--recovery-cache-dir",
+                    str(recovery_cache_dir),
+                ],
+                env=env,
+            )
+            self.assertEqual(completed.returncode, 0, msg=completed.stderr)
+            self.assertIn("Skipped unresolved-lumi task(s): crab_sample_cfg", completed.stdout)
+            self.assertIn(f"crab report -d {task_path}", completed.stdout)
+            self.assertIn("python3 crab_recovery_task_builder.py resolve-lumi-mask", completed.stdout)
+            self.assertIn("python3 crab_recovery_task_builder.py render-one", completed.stdout)
 
     def test_kill_recover_execute_falls_back_to_original_mask_when_report_has_no_not_finished_and_no_jobs_finished(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
