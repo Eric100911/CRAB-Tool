@@ -333,6 +333,10 @@ render recovery configs, or list executable recovery tasks.
 task_dir<TAB>task_path<TAB>report_dir<TAB>preserved_not_finished_lumis<TAB>recover_cfg<TAB>classification
 ```
 
+`render-all --skip-unresolved-lumi` keeps the same state-file-driven task
+selection, but skips executable tasks whose normal recovery path still needs a
+later `crab report` before a concrete recovery lumi mask exists.
+
 ## Recovery classification
 
 `prepare_recovery_tasks.sh` reads and updates `status_cache/latest_state.json`
@@ -417,6 +421,11 @@ DRY_RUN=0 ./submit.sh
   `recovery_cache/reports/<task>/`, then `crab kill`, and finally `crab submit`
   of a new config that reuses the original task settings with a new request
   name and the preserved not-finished lumi coverage.
+- `./kill_unfinished_and_submit_recover.sh --rebuild-plan --dry-run` now works
+  for that normal recovery path as well. Plan rebuilding refreshes recovery
+  metadata and prints the later `report -> kill -> resolve-lumi-mask ->
+  render-one -> submit` sequence without requiring `prepare_recovery_tasks.sh`
+  to pre-render every executable task up front.
 - The generated recovery config is now rendered through
   `crab3_recovery_template.py`, which now uses the same direct WMCore-style
   CRAB syntax as the original template. The builder parses literal
