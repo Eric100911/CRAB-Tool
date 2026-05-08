@@ -144,6 +144,7 @@ def make_recovery_state(
     classification: str,
     job_states: dict[str, int],
     has_child_attempt: bool = False,
+    failed_retries: int = 0,
 ) -> tuple[Path, Path, Path]:
     install_fake_wmcore(tmp)
     cfg_path = tmp / "sample_cfg.py"
@@ -154,11 +155,15 @@ def make_recovery_state(
     task_path.mkdir()
     jobs: dict[str, dict[str, object]] = {}
     next_job_id = 1
+    failed_job_ids: list[str] = []
     for state_name, count in job_states.items():
         for _ in range(count):
             job = {"State": state_name}
             if state_name in {"idle", "cooloff", "running", "transferring"}:
                 job["SubmitTimes"] = [1]
+            if state_name == "failed":
+                job["Retries"] = failed_retries
+                failed_job_ids.append(str(next_job_id))
             jobs[str(next_job_id)] = job
             next_job_id += 1
     report_dir = recovery_cache_dir / "reports" / "crab_sample_cfg"
@@ -198,8 +203,8 @@ def make_recovery_state(
                         "status": {
                             "status_collection_state": "ok_json",
                             "job_states": job_states,
-                            "failed_job_count": 0,
-                            "failed_job_ids": [],
+                            "failed_job_count": len(failed_job_ids),
+                            "failed_job_ids": failed_job_ids,
                             "jobs": jobs,
                         },
                         "recovery": {
@@ -276,6 +281,19 @@ class CrabCliWrapperTest(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 0)
         self.assertIn("Usage: ./prepare_recovery_tasks.sh", completed.stdout)
+        self.assertIn("--include-repeated-failures", completed.stdout)
+        self.assertIn("--failed-retry-threshold", completed.stdout)
+        self.assertNotIn("CMSSW environment is not active", completed.stderr)
+
+    def test_kill_recover_help_short_circuits_preflight(self) -> None:
+        env = self.base_env()
+        completed = self.run_command(
+            ["bash", str(KILL_RECOVER_SH), "--help"], env=env
+        )
+        self.assertEqual(completed.returncode, 0)
+        self.assertIn("Usage: ./kill_unfinished_and_submit_recover.sh", completed.stdout)
+        self.assertIn("--include-repeated-failures", completed.stdout)
+        self.assertIn("--failed-retry-threshold", completed.stdout)
         self.assertNotIn("CMSSW environment is not active", completed.stderr)
 
     def test_prepare_recovery_use_cached_status_skips_unresolved_lumi_render(self) -> None:
@@ -1060,6 +1078,66 @@ class CrabCliWrapperTest(unittest.TestCase):
             self.assertIn(f"crab report -d {task_path}", completed.stdout)
             self.assertIn("python3 crab_recovery_task_builder.py resolve-lumi-mask", completed.stdout)
             self.assertIn("python3 crab_recovery_task_builder.py render-one", completed.stdout)
+
+    def test_kill_recover_rebuild_plan_can_include_repeated_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            proxy_path, crab_log = make_fake_tools(tmp)
+            manifest_path = tmp / "manifest.txt"
+            recovery_cache_dir = tmp / "recovery_cache"
+            recovery_cache_dir.mkdir()
+            status_cache_dir = tmp / "status_cache"
+            cfg_path, task_path, _state_path = make_recovery_state(
+                tmp,
+                status_cache_dir,
+                recovery_cache_dir,
+                classification="failed_only",
+                job_states={"failed": 1},
+                failed_retries=1,
+            )
+            manifest_path.write_text(f"{cfg_path}\n")
+
+            env = self.base_env()
+            env.update(
+                {
+                    "PATH": f"{tmp / 'bin'}:{env['PATH']}",
+                    "PYTHONPATH": f"{tmp}:{env.get('PYTHONPATH', '')}",
+                    "X509_USER_PROXY": str(proxy_path),
+                    "FAKE_PROXY_PATH": str(proxy_path),
+                    "FAKE_CRAB_LOG": str(crab_log),
+                    "CMSSW_BASE": "/tmp/cmssw",
+                    "CMSSW_RELEASE_BASE": "/tmp/cmssw_release",
+                    "SCRAM_ARCH": "el9_amd64_gcc13",
+                }
+            )
+
+            completed = self.run_command(
+                [
+                    "bash",
+                    str(KILL_RECOVER_SH),
+                    "--rebuild-plan",
+                    "--dry-run",
+                    "--use-cached-status",
+                    "--include-repeated-failures",
+                    "--failed-retry-threshold",
+                    "1",
+                    "--manifest",
+                    str(manifest_path),
+                    "--status-cache-dir",
+                    str(status_cache_dir),
+                    "--recovery-cache-dir",
+                    str(recovery_cache_dir),
+                ],
+                env=env,
+            )
+            self.assertEqual(completed.returncode, 0, msg=completed.stderr)
+            self.assertIn(
+                "repeated_failure=1",
+                completed.stdout,
+            )
+            self.assertIn("[repeated_failure_recovery_candidate]", completed.stdout)
+            self.assertIn(f"crab report -d {task_path}", completed.stdout)
+            self.assertIn("crab kill -d", completed.stdout)
 
     def test_kill_recover_execute_falls_back_to_original_mask_when_report_has_no_not_finished_and_no_jobs_finished(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

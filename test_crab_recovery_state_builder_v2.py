@@ -291,6 +291,103 @@ class CrabRecoveryStateBuilderTest(unittest.TestCase):
             self.assertTrue(attempt["recovery"]["executable"])
             self.assertTrue(attempt["recovery"]["kill_required"])
 
+    def test_derive_recovery_leaves_repeated_failures_failed_only_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            state, attempt = recovery_state_with_attempt(
+                tmp,
+                task_dir="crab_parent",
+                server_status="SUBMITTED",
+                scheduler_status="FAILED",
+                job_states={"1": {"State": "failed", "Retries": 1}},
+                failed_job_count=1,
+            )
+            builder.derive_recovery_for_attempt(
+                state, attempt, tmp / "recovery_cache", 48.0, "recover"
+            )
+            self.assertEqual(attempt["recovery"]["classification"], "failed_only")
+            self.assertEqual(attempt["recovery"]["repeated_failure_job_ids"], [])
+            self.assertFalse(attempt["recovery"]["executable"])
+
+    def test_derive_recovery_promotes_repeated_failed_jobs_when_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            state, attempt = recovery_state_with_attempt(
+                tmp,
+                task_dir="crab_parent",
+                server_status="SUBMITTED",
+                scheduler_status="FAILED",
+                job_states={"1": {"State": "failed", "Retries": 1}},
+                failed_job_count=1,
+            )
+            builder.derive_recovery_for_attempt(
+                state,
+                attempt,
+                tmp / "recovery_cache",
+                48.0,
+                "recover",
+                include_repeated_failures=True,
+                failed_retry_threshold=1,
+            )
+            self.assertEqual(
+                attempt["recovery"]["classification"],
+                "repeated_failure_recovery_candidate",
+            )
+            self.assertEqual(attempt["recovery"]["repeated_failure_job_ids"], ["1"])
+            self.assertEqual(attempt["recovery"]["recovery_job_ids"], ["1"])
+            self.assertEqual(attempt["recovery"]["failed_retry_threshold"], 1)
+            self.assertTrue(attempt["recovery"]["executable"])
+
+    def test_derive_recovery_respects_failed_retry_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            state, attempt = recovery_state_with_attempt(
+                tmp,
+                task_dir="crab_parent",
+                server_status="SUBMITTED",
+                scheduler_status="FAILED",
+                job_states={"1": {"State": "failed", "Retries": 1}},
+                failed_job_count=1,
+            )
+            builder.derive_recovery_for_attempt(
+                state,
+                attempt,
+                tmp / "recovery_cache",
+                48.0,
+                "recover",
+                include_repeated_failures=True,
+                failed_retry_threshold=2,
+            )
+            self.assertEqual(attempt["recovery"]["classification"], "failed_only")
+            self.assertEqual(attempt["recovery"]["repeated_failure_job_ids"], [])
+
+    def test_derive_recovery_marks_repeated_failures_with_blockers_as_mixed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            state, attempt = recovery_state_with_attempt(
+                tmp,
+                task_dir="crab_parent",
+                server_status="SUBMITTED",
+                scheduler_status="FAILED",
+                job_states={
+                    "1": {"State": "failed", "Retries": 1},
+                    "2": {"State": "running"},
+                },
+                failed_job_count=1,
+            )
+            builder.derive_recovery_for_attempt(
+                state,
+                attempt,
+                tmp / "recovery_cache",
+                48.0,
+                "recover",
+                include_repeated_failures=True,
+                failed_retry_threshold=1,
+            )
+            self.assertEqual(attempt["recovery"]["classification"], "mixed")
+            self.assertEqual(attempt["recovery"]["repeated_failure_job_ids"], ["1"])
+            self.assertEqual(attempt["recovery"]["blocking_job_ids"], ["2"])
+
     def test_record_submission_appends_linear_family_child(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)

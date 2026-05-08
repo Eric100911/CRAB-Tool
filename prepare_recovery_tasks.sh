@@ -8,10 +8,12 @@ source "${SCRIPT_DIR}/crab_common.sh"
 MANIFEST="${CRAB_MANIFEST:-generated_crab_configs.txt}"
 CLI_USE_CACHED_STATUS=""
 CLI_REFRESH_TERMINAL_STATUSES=""
+CLI_INCLUDE_REPEATED_FAILURES=""
 STATUS_CACHE_DIR="${STATUS_CACHE_DIR:-status_cache}"
 RECOVERY_CACHE_DIR="${RECOVERY_CACHE_DIR:-recovery_cache}"
 STATE_FILE="${STATUS_CACHE_DIR}/latest_state.json"
 STUCK_HOURS="${STUCK_HOURS:-48}"
+FAILED_RETRY_THRESHOLD="${FAILED_RETRY_THRESHOLD:-1}"
 SHOW_HELP=0
 
 show_help() {
@@ -28,6 +30,10 @@ Options:
   --recovery-cache-dir PATH
                           Recovery cache directory. Falls back to RECOVERY_CACHE_DIR.
   --stuck-hours HOURS     Minimum idle/cooloff age required for recovery planning.
+  --include-repeated-failures
+                          Promote failed jobs that already reached the retry threshold.
+  --failed-retry-threshold N
+                          Minimum CRAB retry count for repeated-failure recovery.
   --use-cached-status     Reuse the existing status snapshot if it exists.
   --refresh-status        Force a fresh status collection before planning recovery.
   --refresh-terminal-statuses
@@ -38,6 +44,9 @@ Environment fallback:
   STATUS_CACHE_DIR        Default status cache directory.
   RECOVERY_CACHE_DIR      Default recovery cache directory.
   STUCK_HOURS             Default stuck-job threshold in hours.
+  INCLUDE_REPEATED_FAILURES
+                          Default repeated-failure recovery mode.
+  FAILED_RETRY_THRESHOLD  Default failed-job retry threshold.
   USE_CACHED_STATUS       Default cache reuse mode (accepted values: 0/1/true/false).
 
 Preconditions:
@@ -47,6 +56,7 @@ Preconditions:
 Examples:
   ./prepare_recovery_tasks.sh
   ./prepare_recovery_tasks.sh --use-cached-status --stuck-hours 72
+  ./prepare_recovery_tasks.sh --include-repeated-failures --failed-retry-threshold 1
 
 Outputs:
   status_cache/latest_state.json
@@ -80,6 +90,19 @@ while (($#)); do
             STUCK_HOURS="$2"
             shift 2
             ;;
+        --include-repeated-failures)
+            CLI_INCLUDE_REPEATED_FAILURES=1
+            shift
+            ;;
+        --skip-repeated-failures)
+            CLI_INCLUDE_REPEATED_FAILURES=0
+            shift
+            ;;
+        --failed-retry-threshold)
+            require_option_value "$1" "${2:-}"
+            FAILED_RETRY_THRESHOLD="$2"
+            shift 2
+            ;;
         --use-cached-status)
             CLI_USE_CACHED_STATUS=1
             shift
@@ -104,6 +127,7 @@ if [[ "${SHOW_HELP}" == "1" ]]; then
 fi
 
 USE_CACHED_STATUS="$(resolve_bool "USE_CACHED_STATUS" "${CLI_USE_CACHED_STATUS}" "${USE_CACHED_STATUS:-}" "0")"
+INCLUDE_REPEATED_FAILURES="$(resolve_bool "INCLUDE_REPEATED_FAILURES" "${CLI_INCLUDE_REPEATED_FAILURES}" "${INCLUDE_REPEATED_FAILURES:-}" "0")"
 STATE_FILE="${STATUS_CACHE_DIR}/latest_state.json"
 
 require_cmssw_env
@@ -121,10 +145,19 @@ if [[ "${USE_CACHED_STATUS}" != "1" || ! -f "${STATE_FILE}" ]]; then
     ./status.sh "${status_args[@]}"
 fi
 
-python3 crab_recovery_task_builder.py refresh-recovery \
-    --state-file "${STATE_FILE}" \
-    --output-dir "${RECOVERY_CACHE_DIR}" \
+refresh_recovery_args=(
+    crab_recovery_task_builder.py
+    refresh-recovery
+    --state-file "${STATE_FILE}"
+    --output-dir "${RECOVERY_CACHE_DIR}"
     --stuck-hours "${STUCK_HOURS}"
+    --failed-retry-threshold "${FAILED_RETRY_THRESHOLD}"
+)
+if [[ "${INCLUDE_REPEATED_FAILURES}" == "1" ]]; then
+    refresh_recovery_args+=(--include-repeated-failures)
+fi
+
+python3 "${refresh_recovery_args[@]}"
 
 python3 crab_recovery_task_builder.py render-all \
     --state-file "${STATE_FILE}" \

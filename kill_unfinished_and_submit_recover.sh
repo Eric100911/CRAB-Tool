@@ -11,8 +11,10 @@ CLI_USE_CACHED_STATUS=""
 CLI_USE_PREPARED_PLAN=""
 CLI_ALLOW_MIXED_TASKS=""
 CLI_REFRESH_TERMINAL_STATUSES=""
+CLI_INCLUDE_REPEATED_FAILURES=""
 STATUS_CACHE_DIR="${STATUS_CACHE_DIR:-status_cache}"
 RECOVERY_CACHE_DIR="${RECOVERY_CACHE_DIR:-recovery_cache}"
+FAILED_RETRY_THRESHOLD="${FAILED_RETRY_THRESHOLD:-1}"
 STATE_FILE="${STATUS_CACHE_DIR}/latest_state.json"
 SHOW_HELP=0
 
@@ -41,6 +43,11 @@ Options:
   --rebuild-plan            Refresh recovery metadata before executing.
   --allow-mixed-tasks       Include mixed tasks in the execution set.
   --skip-mixed-tasks        Exclude mixed tasks even if ALLOW_MIXED_TASKS is set.
+  --include-repeated-failures
+                            Promote failed jobs that already reached the retry threshold.
+  --skip-repeated-failures  Disable repeated-failure recovery even if env enables it.
+  --failed-retry-threshold N
+                            Minimum CRAB retry count for repeated-failure recovery.
 
 Environment fallback:
   CRAB_MANIFEST             Default manifest path.
@@ -50,6 +57,8 @@ Environment fallback:
   USE_CACHED_STATUS         Default cache reuse mode (accepted values: 0/1/true/false).
   USE_PREPARED_PLAN         Default plan reuse mode (accepted values: 0/1/true/false).
   ALLOW_MIXED_TASKS         Default mixed-task mode (accepted values: 0/1/true/false).
+  INCLUDE_REPEATED_FAILURES Default repeated-failure recovery mode.
+  FAILED_RETRY_THRESHOLD    Default failed-job retry threshold.
 
 Preconditions:
   - Run 'cmsenv' in this CMSSW work area first.
@@ -59,6 +68,7 @@ Examples:
   ./kill_unfinished_and_submit_recover.sh
   ./kill_unfinished_and_submit_recover.sh --execute
   ./kill_unfinished_and_submit_recover.sh --execute --allow-mixed-tasks
+  ./kill_unfinished_and_submit_recover.sh --execute --rebuild-plan --include-repeated-failures
 
 Notes:
   - Killed tasks without a JSON status payload are still eligible for recovery.
@@ -183,6 +193,19 @@ while (($#)); do
             CLI_ALLOW_MIXED_TASKS=0
             shift
             ;;
+        --include-repeated-failures)
+            CLI_INCLUDE_REPEATED_FAILURES=1
+            shift
+            ;;
+        --skip-repeated-failures)
+            CLI_INCLUDE_REPEATED_FAILURES=0
+            shift
+            ;;
+        --failed-retry-threshold)
+            require_option_value "$1" "${2:-}"
+            FAILED_RETRY_THRESHOLD="$2"
+            shift 2
+            ;;
         *)
             die "Unknown option for ./kill_unfinished_and_submit_recover.sh: $1"
             ;;
@@ -198,6 +221,7 @@ DRY_RUN="$(resolve_bool "DRY_RUN" "${CLI_DRY_RUN}" "${DRY_RUN:-}" "1")"
 USE_CACHED_STATUS="$(resolve_bool "USE_CACHED_STATUS" "${CLI_USE_CACHED_STATUS}" "${USE_CACHED_STATUS:-}" "0")"
 USE_PREPARED_PLAN="$(resolve_bool "USE_PREPARED_PLAN" "${CLI_USE_PREPARED_PLAN}" "${USE_PREPARED_PLAN:-}" "0")"
 ALLOW_MIXED_TASKS="$(resolve_bool "ALLOW_MIXED_TASKS" "${CLI_ALLOW_MIXED_TASKS}" "${ALLOW_MIXED_TASKS:-}" "0")"
+INCLUDE_REPEATED_FAILURES="$(resolve_bool "INCLUDE_REPEATED_FAILURES" "${CLI_INCLUDE_REPEATED_FAILURES}" "${INCLUDE_REPEATED_FAILURES:-}" "0")"
 STATE_FILE="${STATUS_CACHE_DIR}/latest_state.json"
 
 require_cmssw_env
@@ -217,6 +241,10 @@ if [[ "${USE_PREPARED_PLAN}" != "1" || ! -f "${STATE_FILE}" ]]; then
     fi
     if [[ -n "${CLI_REFRESH_TERMINAL_STATUSES}" ]]; then
         prepare_args+=(--refresh-terminal-statuses)
+    fi
+    prepare_args+=(--failed-retry-threshold "${FAILED_RETRY_THRESHOLD}")
+    if [[ "${INCLUDE_REPEATED_FAILURES}" == "1" ]]; then
+        prepare_args+=(--include-repeated-failures)
     fi
     ./prepare_recovery_tasks.sh "${prepare_args[@]}"
 fi

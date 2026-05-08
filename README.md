@@ -196,6 +196,8 @@ Key options:
 - `--status-cache-dir PATH`
 - `--recovery-cache-dir PATH`
 - `--stuck-hours HOURS`
+- `--include-repeated-failures`
+- `--failed-retry-threshold N`
 
 Outputs:
 
@@ -272,6 +274,8 @@ Key options:
 - `--refresh-terminal-statuses`
 - `--allow-mixed-tasks`
 - `--skip-mixed-tasks`
+- `--include-repeated-failures`
+- `--failed-retry-threshold N`
 
 ### `kill.sh`
 
@@ -350,10 +354,20 @@ and classifies the latest attempt in each recovery family into:
 - `mixed`: tasks that have recovery-candidate jobs but also still contain other
   non-finished jobs such as `running`, `transferring`, `failed`, or fresher
   `idle` / `cooloff` jobs.
+- `repeated_failure_recovery_candidate`: tasks selected only when
+  `--include-repeated-failures` is set, where failed jobs have reached the
+  configured CRAB `Retries` threshold and should move to the task-level
+  kill-and-recovery flow instead of another `crab resubmit`.
 - `failed_only`: tasks that only need the existing `./resubmit.sh` flow.
 
 Mixed tasks are excluded from recovery execution by default. Add
 `--allow-mixed-tasks` when you want to include them.
+
+Repeated failed jobs are excluded from recovery by default. Add
+`--include-repeated-failures` to `prepare_recovery_tasks.sh` or
+`kill_unfinished_and_submit_recover.sh --rebuild-plan` to promote failed jobs
+whose CRAB status JSON reports `Retries >= --failed-retry-threshold`; the
+default threshold is `1`.
 
 ## Environment variable compatibility
 
@@ -369,6 +383,8 @@ environment variables as fallbacks:
 - `USE_PREPARED_PLAN`
 - `ALLOW_MIXED_TASKS`
 - `STUCK_HOURS`
+- `INCLUDE_REPEATED_FAILURES`
+- `FAILED_RETRY_THRESHOLD`
 
 Precedence is:
 

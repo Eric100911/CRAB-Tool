@@ -548,6 +548,8 @@ def clear_stale_recovery(recovery: dict[str, Any]) -> dict[str, Any]:
         **preserved,
         "classification": recovery.get("classification", "no_action"),
         "recovery_job_ids": [],
+        "repeated_failure_job_ids": [],
+        "failed_retry_threshold": recovery.get("failed_retry_threshold"),
         "recovery_state_counts": {},
         "blocking_job_ids": [],
         "blocking_state_counts": {},

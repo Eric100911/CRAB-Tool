@@ -39,6 +39,7 @@ NON_FINISHED_STATES = {
     "failed",
 }
 DEFAULT_STUCK_HOURS = 48.0
+DEFAULT_FAILED_RETRY_THRESHOLD = 1
 RECOVERY_SUFFIX = "recover"
 STATE_NAME = "latest_state.json"
 PLAN_NAME = STATE_NAME
@@ -54,6 +55,7 @@ RECOVERY_RENDER_CLASSES = {
     "mixed",
     "killed_recovery_candidate",
     "holding_resubmit_recovery_candidate",
+    "repeated_failure_recovery_candidate",
 }
 DEFAULT_RECOVERY_UNITS_PER_JOB = 100
 DEFAULT_RECOVERY_NUM_CORES = 1
@@ -202,6 +204,32 @@ def add_state_file_argument(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_repeated_failure_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--include-repeated-failures",
+        action="store_true",
+        help=(
+            "Promote failed jobs with at least --failed-retry-threshold CRAB "
+            "retries into task-level recovery."
+        ),
+    )
+    parser.add_argument(
+        "--failed-retry-threshold",
+        type=int,
+        default=DEFAULT_FAILED_RETRY_THRESHOLD,
+        help=(
+            "Minimum CRAB retry count required before a failed "
+            "job is eligible for repeated-failure recovery."
+        ),
+    )
+    parser.add_argument(
+        "--failed-submit-threshold",
+        type=int,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -248,6 +276,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=RECOVERY_SUFFIX,
         help="Suffix family used for generated recovery request names.",
     )
+    add_repeated_failure_arguments(refresh_parser)
 
     plan_parser = subparsers.add_parser(
         "plan",
@@ -264,6 +293,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     plan_parser.add_argument("--output-dir", default="recovery_cache")
     plan_parser.add_argument("--stuck-hours", type=float, default=DEFAULT_STUCK_HOURS)
     plan_parser.add_argument("--recovery-suffix", default=RECOVERY_SUFFIX)
+    add_repeated_failure_arguments(plan_parser)
 
     render_parser = subparsers.add_parser(
         "render-one",
@@ -644,6 +674,16 @@ def find_attempt(state: dict[str, Any], task_dir: str) -> dict[str, Any]:
 
 def positive_submit_times(job: dict[str, Any]) -> list[float]:
     return [float(value) for value in job.get("SubmitTimes", []) if value and value > 0]
+
+
+def retry_count(job: dict[str, Any]) -> int:
+    raw_value = job.get("Retries")
+    if raw_value is None:
+        return 0
+    try:
+        return int(raw_value)
+    except (TypeError, ValueError):
+        return 0
 
 
 def last_positive_submit_time(job: dict[str, Any]) -> float | None:
@@ -1051,6 +1091,8 @@ def derive_recovery_for_attempt(
     output_dir: Path,
     stuck_hours: float,
     recovery_suffix: str,
+    include_repeated_failures: bool = False,
+    failed_retry_threshold: int = DEFAULT_FAILED_RETRY_THRESHOLD,
 ) -> None:
     status = attempt.get("status", {})
     status_collection_state = str(
@@ -1075,6 +1117,19 @@ def derive_recovery_for_attempt(
             recovery_job_ids.append(str(job_id))
         elif reason == "missing-positive-submit-time":
             skipped_jobs_without_time.append(str(job_id))
+
+    repeated_failure_job_ids: list[str] = []
+    if include_repeated_failures:
+        retry_threshold = max(1, int(failed_retry_threshold))
+        for job_id, job in sorted(jobs.items(), key=lambda item: int(item[0])):
+            if str(job.get("State", "unknown")) != "failed":
+                continue
+            if retry_count(job) >= retry_threshold:
+                repeated_failure_job_ids.append(str(job_id))
+        recovery_job_ids = sorted(
+            set(recovery_job_ids).union(repeated_failure_job_ids),
+            key=lambda value: int(value),
+        )
 
     recovery_job_id_set = set(recovery_job_ids)
     blocking_job_ids: list[str] = []
@@ -1106,6 +1161,8 @@ def derive_recovery_for_attempt(
             classification = "holding_resubmit_pending"
     elif recovery_job_ids and blocking_job_ids:
         classification = "mixed"
+    elif repeated_failure_job_ids:
+        classification = "repeated_failure_recovery_candidate"
     elif recovery_job_ids:
         classification = "recovery_candidate"
     elif int(status.get("failed_job_count", 0)):
@@ -1125,6 +1182,8 @@ def derive_recovery_for_attempt(
         {
             "classification": classification,
             "recovery_job_ids": recovery_job_ids,
+            "repeated_failure_job_ids": repeated_failure_job_ids,
+            "failed_retry_threshold": int(failed_retry_threshold),
             "recovery_state_counts": count_states(jobs, recovery_job_id_set),
             "blocking_job_ids": blocking_job_ids,
             "blocking_state_counts": count_states(jobs, set(blocking_job_ids)),
@@ -1151,6 +1210,17 @@ def refresh_recovery_state(args: argparse.Namespace) -> int:
     state = load_state(state_path, output_dir)
     state["stuck_hours"] = float(args.stuck_hours)
     state["recovery_suffix"] = str(args.recovery_suffix)
+    failed_retry_threshold = int(
+        args.failed_submit_threshold - 1
+        if getattr(args, "failed_submit_threshold", None) is not None
+        else getattr(args, "failed_retry_threshold", DEFAULT_FAILED_RETRY_THRESHOLD)
+    )
+    if failed_retry_threshold < 1:
+        raise ValueError("--failed-retry-threshold must be positive.")
+    state["include_repeated_failures"] = bool(
+        getattr(args, "include_repeated_failures", False)
+    )
+    state["failed_retry_threshold"] = failed_retry_threshold
     rebuild_families(state)
 
     for attempt in state["attempts"].values():
@@ -1165,6 +1235,7 @@ def refresh_recovery_state(args: argparse.Namespace) -> int:
         "killed_recovery_candidate": 0,
         "holding_resubmit_recovery_candidate": 0,
         "holding_resubmit_pending": 0,
+        "repeated_failure_recovery_candidate": 0,
         "failed_only": 0,
         "no_action": 0,
         "query_error": 0,
@@ -1176,6 +1247,8 @@ def refresh_recovery_state(args: argparse.Namespace) -> int:
             output_dir,
             float(args.stuck_hours),
             str(args.recovery_suffix),
+            bool(getattr(args, "include_repeated_failures", False)),
+            failed_retry_threshold,
         )
         classification = str(attempt["recovery"]["classification"])
         counts[classification] = counts.get(classification, 0) + 1
@@ -1203,6 +1276,7 @@ def refresh_recovery_state(args: argparse.Namespace) -> int:
         f"killed={counts['killed_recovery_candidate']} "
         f"holding_recovery={counts['holding_resubmit_recovery_candidate']} "
         f"holding_pending={counts['holding_resubmit_pending']} "
+        f"repeated_failure={counts['repeated_failure_recovery_candidate']} "
         f"mixed={counts['mixed']} "
         f"failed_only={counts['failed_only']} "
         f"no_action={counts['no_action']}"
@@ -1469,6 +1543,7 @@ def list_executable(args: argparse.Namespace) -> int:
         "recovery_candidate",
         "killed_recovery_candidate",
         "holding_resubmit_recovery_candidate",
+        "repeated_failure_recovery_candidate",
     }
     if args.include_mixed:
         include_classes.add("mixed")
